@@ -1,3 +1,6 @@
+## Architecture
+
+```text
 agentic-rag-system/
 │
 ├── projects/
@@ -16,6 +19,7 @@ agentic-rag-system/
 ├── main.py                      # Main LangGraph/Deep-Agent Orchestrator
 ├── .env                         # Your API keys (OpenAI, Tavily, AWS credentials)
 └── requirements.txt             # Project library dependencies
+```
 
 # to start the system
 
