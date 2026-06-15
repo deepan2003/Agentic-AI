@@ -1,0 +1,11 @@
+deepagents
+langchain
+langchain-openai
+langgraph
+tavily-python
+pydantic
+beautifulsoup4
+requests
+faiss-cpu
+boto3
+python-dotenv
