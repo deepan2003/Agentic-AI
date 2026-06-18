@@ -1,4 +1,7 @@
 deepagents
+langchain_community
+langchain-huggingface
+sentence-transformers
 langchain
 langchain-openai
 langgraph
@@ -9,3 +12,5 @@ requests
 faiss-cpu
 boto3
 python-dotenv
+pypdf
+langchain-text-splitters

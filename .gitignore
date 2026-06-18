@@ -1,2 +1,8 @@
 *.env
 *.jpeg
+*.csv
+*.pyc
+
+/tmp_downloads
+/__pycache__
+/vector_store
