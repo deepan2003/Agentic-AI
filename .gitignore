@@ -2,8 +2,12 @@
 *.jpeg
 *.csv
 *.pyc
+*.png
+*.json
+
 
 /tmp_downloads
 /__pycache__
 /vector_store
 /projects
+/generating dataset for langsmith
