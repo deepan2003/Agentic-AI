@@ -4,6 +4,7 @@
 *.pyc
 *.png
 *.json
+*.pem
 
 
 /tmp_downloads

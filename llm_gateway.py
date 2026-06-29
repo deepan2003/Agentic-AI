@@ -45,7 +45,12 @@ class SmartLLMGateway:
         tier = PRICING_TIERS.get(model_name, {"input": 0.1, "output": 0.1})
         cost = ((input_tokens / 1_000_000) * tier["input"]) + ((output_tokens / 1_000_000) * tier["output"])
         self.total_cost_usd += cost
+        
+        # This only prints to your terminal prompt:
         print(f"[Gateway Metrics] Query Cost: ${cost:.6f} | Session Total: ${self.total_cost_usd:.6f}")
+        
+        # 🛡️ ADD THIS LINE BELOW TO SEND IT TO STREAMLIT:
+        self.execution_logs.append(f"[Gateway Metrics] Query Cost: ${cost:.6f}")
 
     def completion(self, messages: List[Dict[str, str]], override_model: str = None) -> Any:
         """Pillar 1: Unified API function wrapper."""
