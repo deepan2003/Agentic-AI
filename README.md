@@ -461,3 +461,7 @@ Pushes the synthetic dataset to LangSmith and runs all 4 judge metrics. View res
 | **Frontend** | Streamlit |
 | **Evaluation** | LangSmith, Groq judge LLM |
 | **Security** | Regex guardrails, LLM cognitive guardrails, Pydantic validation |
+
+# restart system
+
+nohup python -u app.py > backend.log 2>&1 &

@@ -4,6 +4,7 @@ import os
 import re
 import time
 from datetime import datetime
+import uuid
 
 st.set_page_config(page_title="Agentic RAG Gateway", page_icon="🤖", layout="wide")
 st.title("🤖 Intelligent Enterprise RAG Gateway")
@@ -12,19 +13,46 @@ st.caption("Powered by Smart LLM Routing Engine & Cross-Provider Fallbacks")
 FLASK_API_URL = "http://127.0.0.1:5050/api/chat"
 UPDATE_API_URL = "http://127.0.0.1:5050/api/update_knowledge"
 
+# --- USER IDENTIFICATION SYSTEM (LOCKED STATE) ---
+st.sidebar.title("👤 User Profile")
+
+# Initialize the thread_id state if it doesn't exist yet
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = None
+
+# If the user hasn't logged in yet, show the input box
+if not st.session_state.thread_id:
+    user_id_input = st.sidebar.text_input("Enter your Username / Employee ID:")
+    
+    if user_id_input:
+        # Once they press Enter, save the ID, clear history, and reload!
+        st.session_state.thread_id = user_id_input
+        st.session_state.messages = [] 
+        st.rerun() 
+    else:
+        # Halt execution until they provide an ID
+        st.warning("👈 Please enter your Username in the sidebar to securely connect to your personal chat history thread.")
+        st.stop()
+else:
+    # If they ARE logged in, hide the input box and show uneditable text
+    st.sidebar.success(f"Verified User: **{st.session_state.thread_id}**")
+
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- NEW DAILY RESET LOGIC ---
-# 1. Grab the real-world current date (e.g., "2026-06-27")
+# --- DAILY RESET LOGIC ---
+# Grab the real-world current date string (YYYY-MM-DD)
 current_date = datetime.now().strftime("%Y-%m-%d")
 
-# 2. If it's a brand new session, OR if the calendar day has changed, wipe the history!
+# If calendar date rolls over into a new day, clear out prior execution history
 if "cost_date" not in st.session_state or st.session_state.cost_date != current_date:
     st.session_state.cost_history = []
     st.session_state.cost_date = current_date
 
+
 # --- Sidebar Document Explorer ---
+st.sidebar.markdown("---")
 st.sidebar.title("📂 Saved Documents")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
@@ -43,7 +71,7 @@ if saved_files:
     for file_name in saved_files:
         file_path = os.path.join(PROJECTS_DIR, file_name)
         
-        # 1. Create side-by-side columns: 80% width for document link, 20% width for 'X' mark
+        # Create side-by-side columns: 80% width for document link, 20% width for 'X' mark
         col_doc, col_del = st.sidebar.columns([4, 1])
         
         with open(file_path, "rb") as file_data:
@@ -55,12 +83,12 @@ if saved_files:
                 use_container_width=True
             )
         
-        # 2. Place the small inline 'X' button in the second column
+        # Place the small inline 'X' button in the second column
         if col_del.button("❌", key=f"del_btn_{file_name}", help=f"Delete {file_name}"):
             st.session_state.file_to_delete = file_name
             st.rerun()
 
-    # 3. Handle the Confirmation Step directly beneath the file layout
+    # Handle the Confirmation Step directly beneath the file layout
     if st.session_state.file_to_delete:
         target_file = st.session_state.file_to_delete
         st.sidebar.markdown("---")
@@ -82,6 +110,7 @@ if saved_files:
             st.rerun()
 else:
     st.sidebar.info("No documents saved yet.")
+
 
 # --- Sidebar Knowledge Base Management ---
 st.sidebar.markdown("---")
@@ -116,11 +145,11 @@ if st.sidebar.button("🔄 Sync S3 Assets to RAG System"):
             pipeline_container.empty()
             st.sidebar.error("Connection Error: Check if Flask backend is alive on port 5050.")
 
+
 # --- Sidebar Cost Tracker Panel ---
 st.sidebar.markdown("---")
 st.sidebar.title("💰 System Cost Analytics")
 
-# Changed to expander to ensure metrics persist across chat interactions
 with st.sidebar.expander("📊 View Query Cost History Log", expanded=False):
     if st.session_state.cost_history:
         st.markdown("### Transaction Ledger")
@@ -130,6 +159,7 @@ with st.sidebar.expander("📊 View Query Cost History Log", expanded=False):
             st.markdown("---")
     else:
         st.info("No cost transactions logged yet.")
+
 
 # --- Main Chat Interface Display ---
 for msg in st.session_state.messages:
@@ -148,7 +178,8 @@ if user_input := st.chat_input("Ask a question or request a technical function..
         
         with loading_container.status("🤖 Orchestrator initializing environment infrastructure...", expanded=True) as status:
             try:
-                payload = {"message": user_input, "thread_id": "production_session_002"}
+                # Dynamic thread extraction ensuring multi-tenant network safety
+                payload = {"message": user_input, "thread_id": st.session_state.thread_id}
                 api_response = requests.post(FLASK_API_URL, json=payload, timeout=180)
                 
                 if api_response.status_code == 200:
