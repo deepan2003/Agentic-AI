@@ -25,6 +25,11 @@ def extract_score(response_text: str) -> int:
     return 3  # Neutral fallback score if the model fails to provide a number
 
 # 2. Define the Target Wrapper Function for LangGraph
+
+# This is the "Test Taker." It takes a question from your JSON dataset, feeds it into 
+# your actual LangGraph AI Agent (agent_system.invoke), and captures 
+# your Agent's final answer.
+
 def predict_rag_system(inputs: dict) -> dict:
     unique_thread = f"eval_thread_{uuid.uuid4()}"
     config = {"configurable": {"thread_id": unique_thread}}
@@ -40,6 +45,8 @@ def predict_rag_system(inputs: dict) -> dict:
 # ====================================================================
 
 def evaluate_correctness(run, example) -> dict:
+# Compares your Agent's answer to the exact "Ground Truth" answer from your dataset.
+
     user_question = example.inputs["question"]
     ground_truth = example.outputs["ground_truth"]
     agent_output = run.outputs["output"]
@@ -56,6 +63,9 @@ def evaluate_correctness(run, example) -> dict:
     return {"key": "correctness", "score": score / 5.0}
 
 def evaluate_concision(run, example) -> dict:
+# Looks only at your Agent's answer and checks if it is bloated with 
+# filler words or straight to the point.
+
     agent_output = run.outputs["output"]
     
     prompt = (
@@ -68,6 +78,9 @@ def evaluate_concision(run, example) -> dict:
     return {"key": "concision", "score": score / 5.0}
 
 def evaluate_groundedness(run, example) -> dict:
+# Checks if your Agent made wild assumptions, made things up, or apologized unnecessarily.
+# This is your core metric for detecting hallucinations.
+
     agent_output = run.outputs["output"]
     
     prompt = (
@@ -80,6 +93,11 @@ def evaluate_groundedness(run, example) -> dict:
     return {"key": "groundedness", "score": score / 5.0}
 
 def evaluate_retrieval_relevance(run, example) -> dict:
+# Compares the original question to the final answer to see 
+# if the core intent was actually addressed.
+# Sometimes an AI will give a technically correct fact, 
+# but it completely missed what the user was actually asking for.
+
     user_question = example.inputs["question"]
     agent_output = run.outputs["output"]
     

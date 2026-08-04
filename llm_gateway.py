@@ -53,7 +53,20 @@ class SmartLLMGateway:
         self.execution_logs.append(f"[Gateway Metrics] Query Cost: ${cost:.6f}")
 
     def completion(self, messages: List[Dict[str, str]], override_model: str = None) -> Any:
-        """Pillar 1: Unified API function wrapper."""
+        """Pillar 1: Unified API function wrapper.
+        Checks if the answer is already saved in the Cache (returns instantly if true).
+
+        Uses Smart Routing to pick the right model.
+
+        Tries to get an answer using your Primary Groq API key.
+
+        Logs the Cost of the tokens used.
+
+        Fallback: If Groq fails or crashes, it automatically switches to 
+        the Gemini API (gemini-3.5-flash) so the user never sees an error.
+                
+        
+        """
         self.execution_logs = []
         self.total_queries += 1
         
