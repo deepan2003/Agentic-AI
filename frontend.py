@@ -10,8 +10,8 @@ st.set_page_config(page_title="Agentic RAG Gateway", page_icon="🤖", layout="w
 st.title("🤖 Intelligent Enterprise RAG Gateway")
 st.caption("Powered by Smart LLM Routing Engine & Cross-Provider Fallbacks")
 
-FLASK_API_URL = "http://127.0.0.1:5050/api/chat"
-UPDATE_API_URL = "http://127.0.0.1:5050/api/update_knowledge"
+FLASK_API_URL = "http://127.0.0.1:5060/api/chat"
+UPDATE_API_URL = "http://127.0.0.1:5060/api/update_knowledge"
 
 # --- USER IDENTIFICATION SYSTEM (LOCKED STATE) ---
 st.sidebar.title("👤 User Profile")
@@ -215,4 +215,4 @@ if user_input := st.chat_input("Ask a question or request a technical function..
                     
             except requests.exceptions.ConnectionError:
                 loading_container.empty()
-                response_placeholder.error("Critical Connection Error: Ensure Flask server is active on Port 5050.")
+                response_placeholder.error("Critical Connection Error: Ensure Flask server is active on Port 5060.")

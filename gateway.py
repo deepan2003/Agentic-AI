@@ -39,6 +39,9 @@ def verify_user_input(user_query: str) -> str:
         )
         
         decision = response.content.strip().upper()
+        print(f"[Gateway Guard DEBUG] Raw decision from model: '{decision}'")
+        with open("/home/ubuntu/Agentic-AI/gateway_errors.log", "a") as f:
+            f.write(f"DEBUG raw decision: '{decision}'\n")
         
         if "BLOCK" in decision:
             print("[Gateway Guard] Blocked by LLM Security Layer: Malicious intent flagged.")
@@ -47,9 +50,10 @@ def verify_user_input(user_query: str) -> str:
         return user_query
 
     except Exception as e:
-        # Fail-secure fallback: If both primary and backup systems fail entirely during a security check,
-        # we must block the request to protect the architecture.
-        print(f"[Gateway Guard Critical Error] Verification engine failed to respond: {str(e)}")
+        error_msg = f"[Gateway Guard Critical Error] {str(e)}"
+        print(error_msg)
+        with open("/home/ubuntu/Agentic-AI/gateway_errors.log", "a") as f:
+            f.write(error_msg + "\n")
         return "SECURITY_BLOCK"
 
 
@@ -58,7 +62,7 @@ def verify_agent_output(agent_response: str, verified_facts: list) -> str:
     Scans the generated agent response to ensure it sticks strictly to the facts 
     and does not hallucinate unverified information.
     """
-    print("[Gateway] Cross-checking final answer against verified facts...")
+    print("[Gateway] Cross-checking final answer against ver ified facts...")
     
     facts_summary = ", ".join(verified_facts) if verified_facts else "No facts provided."
     
