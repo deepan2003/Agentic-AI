@@ -102,5 +102,6 @@ def chat_endpoint():
 
 if __name__ == "__main__":
     flask_port = int(os.environ.get("FLASK_PORT", 5060))
-    print(f"Starting Flask backend on port {flask_port}...", flush=True)
-    app.run(host="0.0.0.0", port=flask_port, debug=False)
+    print(f"Starting Flask backend on 127.0.0.1:{flask_port}...", flush=True)
+    # Bind strictly to 127.0.0.1 so Render only routes external traffic to Streamlit ($PORT)
+    app.run(host="127.0.0.1", port=flask_port, debug=False)
