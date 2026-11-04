@@ -5,7 +5,9 @@ sentence-transformers
 langchain
 langchain-openai
 langgraph
+langchain-tavily
 tavily-python
+langsmith
 pydantic
 beautifulsoup4
 requests
