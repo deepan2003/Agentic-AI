@@ -1,8 +1,6 @@
 # 🤖 Production Agentic RAG System
 
-A full-stack, production-grade **Multi-Agent RAG (Retrieval-Augmented Generation)** system with an intelligent LLM gateway, dual-layer security guardrails, hallucination filtering, and live deployment on AWS EC2.
-
-🔗 **Live Demo:** [http://51.20.249.245:8501](http://51.20.249.245:8501)
+A full-stack, production-grade **Multi-Agent RAG (Retrieval-Augmented Generation)** system with an intelligent LLM gateway, dual-layer security guardrails, hallucination filtering, and live deployment on Render.
 
 ---
 
@@ -19,6 +17,7 @@ A full-stack, production-grade **Multi-Agent RAG (Retrieval-Augmented Generation
 - [Setup & Installation](#setup--installation)
 - [Environment Variables](#environment-variables)
 - [Running the System](#running-the-system)
+- [Deployment on Render](#deployment-on-render)
 - [API Endpoints](#api-endpoints)
 
 ---
@@ -70,7 +69,7 @@ CHITCHAT  SAVE_HISTORY    RESEARCH
     │   │                         │     - LLM relevancy gate
     │   │  ┌─────────────────┐    │     - Tavily web search fallback
     │   │  │ Local PDF FAISS │    │     - BeautifulSoup page fetch
-    │   │  │ (AWS S3 source) │    │     - Query optimizer (year injection)
+    │   │  │ (Cloudinary src)│    │     - Query optimizer (year injection)
     │   │  └─────────────────┘    │
     │   │  ┌─────────────────┐    │
     │   │  │  Tavily Search  │    │
@@ -153,24 +152,23 @@ AGENTIC AI/
 │   └── web_search.py             # custom_web_search + custom_web_fetch (Tavily + BS4)
 │
 ├── vector_store/
-│   └── research_papers/          # FAISS index (auto-built from S3 PDFs via ingestion.py)
+│   └── research_papers/          # FAISS index (auto-built from Cloudinary PDFs via ingestion.py)
 │
 ├── generating dataset for langsmith/  # Synthetic Q&A data scripts for LangSmith eval
 │
 ├── __pycache__/
 │
-├── .env                          # API keys (Groq, Gemini, Tavily, AWS, LangSmith)
+├── .env                          # API keys (Groq, Gemini, Tavily, Cloudinary, LangSmith)
 ├── .gitignore
 ├── agent.md                      # Orchestrator rules (also served from projects/)
-├── app.py                        # Flask REST API server (port 5050)
+├── app.py                        # Flask REST API server (uses PORT env var, default 5060)
 ├── evaluate_system.py            # LangSmith evaluation runner (4 LLM-as-judge metrics)
 ├── frontend.py                   # Streamlit UI (chat + file manager + cost tracker)
 ├── gateway.py                    # Input/output security guardrails
-├── ingestion.py                  # S3 → PDF → FAISS ingestion pipeline
+├── ingestion.py                  # Cloudinary → PDF → FAISS ingestion pipeline
 ├── llm_gateway.py                # SmartLLMGateway (routing, cache, fallback, cost)
 ├── main.py                       # LangGraph orchestrator + intent classifier
-├── rag-agent-user-accessKeys.csv # AWS IAM access keys (keep private, never commit)
-├── rag-key.pem                   # EC2 SSH key (keep private, never commit)
+├── render.yaml                   # Render deployment blueprint
 ├── README.md
 ├── requirements.txt
 ├── sub_agents.py                 # Hybrid Research Sub-Agent + Pydantic FactSheet
@@ -198,7 +196,7 @@ Exposes two endpoints:
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/api/chat` | POST | Accepts `{message, thread_id}`, runs the full agent pipeline, returns `{response, logs}` |
-| `/api/update_knowledge` | POST | Triggers `ingestion.py` to pull PDFs from S3 and hot-swap the FAISS index |
+| `/api/update_knowledge` | POST | Triggers `ingestion.py` to pull PDFs from Cloudinary and hot-swap the FAISS index |
 
 ### `frontend.py` — Streamlit UI
 
@@ -259,7 +257,7 @@ After the agent composes its answer:
 A 6-stage pipeline that produces a structured `FactSheet`:
 
 **Stage 1 — Local FAISS Search**
-Queries the local vector DB (`all-MiniLM-L6-v2` embeddings, top-2 results) built from PDFs in AWS S3.
+Queries the local vector DB (`all-MiniLM-L6-v2` embeddings, top-2 results) built from PDFs in Cloudinary.
 
 **Stage 2 — LLM Relevancy Gate**
 Asks Llama-3.3-70b-versatile: *"Does this local PDF context actually answer the question?"* Returns `YES` or `NO`.
@@ -312,7 +310,8 @@ Each metric is scored 1–5 by **Groq Llama-3.3-70b-versatile** as the judge LLM
 
 - Python 3.10+
 - Conda (recommended)
-- AWS account with S3 bucket + EC2 (for production)
+- Cloudinary account (free tier — 25GB storage)
+- Render account (free tier for deployment)
 - Groq API key (free tier available)
 - Gemini API key (fallback)
 - Tavily API key (web search)
@@ -347,11 +346,14 @@ GEMINI_API_KEY=AIza...
 # Tavily (Web Search)
 TAVILY_API_KEY=tvly-...
 
-# AWS S3 (Knowledge Base Storage)
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
-AWS_DEFAULT_REGION=eu-north-1
-AWS_S3_BUCKET_NAME=your-bucket-name
+# Cloudinary (Knowledge Base Storage — replaces AWS S3)
+CLOUDINARY_CLOUD_NAME=your-cloud-name
+CLOUDINARY_API_KEY=your-api-key
+CLOUDINARY_API_SECRET=your-api-secret
+CLOUDINARY_FOLDER=agentic-rag-data
+
+# E2B (Code Sandbox)
+E2B_API_KEY=e2b_...
 
 # LangSmith (Evaluation — optional)
 LANGCHAIN_API_KEY=ls__...
@@ -363,32 +365,38 @@ LANGCHAIN_PROJECT=agentic-rag
 
 ## Running the System
 
-### 1. Build the Knowledge Base (first time)
+### 1. Upload PDFs to Cloudinary
 
-Upload your PDF files to the configured S3 bucket, then run:
+Upload your PDF research files to Cloudinary as **raw** resources inside a folder (default: `agentic-rag-data`).
+
+You can do this via the [Cloudinary Dashboard](https://console.cloudinary.com/) → Media Library → Upload → select your PDFs → ensure they go into the `agentic-rag-data` folder.
+
+> **Tip:** When uploading, make sure to select "Raw" as the resource type for PDF files.
+
+### 2. Build the Knowledge Base (first time)
 
 ```bash
 conda activate agentic-rag
 python ingestion.py
 ```
 
-This downloads PDFs from S3, splits them into chunks, generates HuggingFace embeddings (`all-MiniLM-L6-v2`), and saves the FAISS index to `./vector_store/research_papers/`.
+This downloads PDFs from Cloudinary, splits them into chunks, generates HuggingFace embeddings (`all-MiniLM-L6-v2`), and saves the FAISS index to `./vector_store/research_papers/`.
 
-### 2. Start the Flask Backend
+### 3. Start the Flask Backend
 
 ```bash
 python app.py
-# Running on http://0.0.0.0:5050
+# Running on http://0.0.0.0:5060
 ```
 
-### 3. Start the Streamlit Frontend
+### 4. Start the Streamlit Frontend
 
 ```bash
 streamlit run frontend.py
 # Running on http://localhost:8501
 ```
 
-### 4. (Optional) CLI Mode
+### 5. (Optional) CLI Mode
 
 ```bash
 python main.py
@@ -396,13 +404,42 @@ python main.py
 
 Runs an interactive terminal chat session with the full agent pipeline.
 
-### 5. (Optional) Run Evaluation
+### 6. (Optional) Run Evaluation
 
 ```bash
 python evaluate_system.py
 ```
 
 Pushes the synthetic dataset to LangSmith and runs all 4 judge metrics. View results at [smith.langchain.com](https://smith.langchain.com).
+
+---
+
+## Deployment on Render
+
+### Quick Deploy
+
+1. Push your code to a GitHub/GitLab repository
+2. Go to [Render Dashboard](https://dashboard.render.com/) → **New** → **Blueprint**
+3. Connect your repo and select the `render.yaml` file
+4. Render will auto-detect the service configuration
+5. Add all required environment variables in the Render dashboard (see [Environment Variables](#environment-variables))
+6. Deploy!
+
+### Manual Deploy
+
+1. Go to [Render Dashboard](https://dashboard.render.com/) → **New** → **Web Service**
+2. Connect your GitHub repo
+3. Set the following:
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 1`
+4. Add environment variables in the Render dashboard
+5. Deploy!
+
+### Running Streamlit on Render
+
+If you want the Streamlit frontend on Render too, create a second web service:
+- **Start Command:** `streamlit run frontend.py --server.port $PORT --server.address 0.0.0.0`
+- Add `BACKEND_URL` env var pointing to your Flask backend's Render URL (e.g., `https://agentic-rag-backend.onrender.com`)
 
 ---
 
@@ -436,8 +473,8 @@ Pushes the synthetic dataset to LangSmith and runs all 4 judge metrics. View res
 {
   "success": true,
   "logs": [
-    "Connecting to AWS S3 Bucket: your-bucket...",
-    "Downloading paper.pdf from S3...",
+    "Connecting to Cloudinary Cloud Storage (folder: agentic-rag-data)...",
+    "Downloading paper.pdf from Cloudinary...",
     "Successfully processed PDF: paper.pdf",
     "Generating embeddings for 142 chunks...",
     "✅ Vector index hot-swapped and live in active memory."
@@ -455,13 +492,9 @@ Pushes the synthetic dataset to LangSmith and runs all 4 judge metrics. View res
 | **LLM Providers** | Groq (Llama-3.1-8b, Llama-3.3-70b), Google Gemini |
 | **Vector DB** | FAISS + HuggingFace `all-MiniLM-L6-v2` |
 | **Web Search** | Tavily API, BeautifulSoup4 |
-| **Cloud Storage** | AWS S3 |
-| **Deployment** | AWS EC2 |
-| **Backend API** | Flask, Flask-CORS |
+| **Cloud Storage** | Cloudinary (Free Tier) |
+| **Deployment** | Render |
+| **Backend API** | Flask, Flask-CORS, Gunicorn |
 | **Frontend** | Streamlit |
 | **Evaluation** | LangSmith, Groq judge LLM |
 | **Security** | Regex guardrails, LLM cognitive guardrails, Pydantic validation |
-
-# restart system
-
-nohup python -u app.py > backend.log 2>&1 &

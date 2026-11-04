@@ -1,5 +1,7 @@
 import os
-import boto3
+import cloudinary
+import cloudinary.api
+import requests as http_requests
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -9,46 +11,65 @@ from langchain_community.document_loaders import PyPDFLoader
 # 1. Load environment variables
 load_dotenv()
 
-BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
+# Configure Cloudinary with environment variables
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
+
+CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "agentic-rag-data")
 VECTOR_DB_PATH = "./vector_store/research_papers"
 TMP_DIR = "./tmp_downloads"
 
-def download_papers_from_s3():
-    """Downloads all files from S3 bucket into a temporary local folder."""
-    print(f"Connecting to AWS S3 Bucket: {BUCKET_NAME}...")
-    s3 = boto3.client('s3')
+def download_papers_from_cloudinary():
+    """Downloads all raw PDF files from Cloudinary folder into a temporary local folder."""
+    print(f"Connecting to Cloudinary Cloud Storage (folder: {CLOUDINARY_FOLDER})...")
     
     if not os.path.exists(TMP_DIR):
         os.makedirs(TMP_DIR)
         
     try:
-        # List all files in the bucket
-        response = s3.list_objects_v2(Bucket=BUCKET_NAME)
-        if 'Contents' not in response:
-            print("No files found in your S3 bucket! Please upload a text or PDF file first.")
+        # List all raw (non-image) resources in the configured folder
+        result = cloudinary.api.resources(
+            type="upload",
+            resource_type="raw",
+            prefix=CLOUDINARY_FOLDER + "/",
+            max_results=500
+        )
+        
+        resources = result.get("resources", [])
+        if not resources:
+            print("No files found in your Cloudinary folder! Please upload a PDF file first.")
             return []
             
         downloaded_files = []
-        for obj in response['Contents']:
-            filename = obj['Key']
+        for resource in resources:
+            public_id = resource["public_id"]
+            filename = public_id.split("/")[-1]  # Get just the filename
             
             # Skip the agent.md rulebook file; we only want research papers here
-            if filename == "agent.md" or filename.startswith("skills/"):
+            if filename == "agent.md" or "skills/" in public_id:
                 continue
                 
             local_path = os.path.join(TMP_DIR, filename)
-            print(f"Downloading {filename} from S3...")
-            s3.download_file(BUCKET_NAME, filename, local_path)
+            secure_url = resource["secure_url"]
+            
+            print(f"Downloading {filename} from Cloudinary...")
+            response = http_requests.get(secure_url, timeout=60)
+            with open(local_path, "wb") as f:
+                f.write(response.content)
             downloaded_files.append(local_path)
             
         return downloaded_files
     except Exception as e:
-        print(f"Error downloading from S3: {str(e)}")
+        print(f"Error downloading from Cloudinary: {str(e)}")
         return []
 
 def build_local_vector_db():
     """Reads downloaded PDFs, chunks text, creates embeddings, and saves FAISS index."""
-    raw_files = download_papers_from_s3()
+    raw_files = download_papers_from_cloudinary()
     if not raw_files:
         print("No research files to process.")
         return

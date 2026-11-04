@@ -6,9 +6,9 @@
 *.json
 *.pem
 
-
 /tmp_downloads
 /__pycache__
 /vector_store
 /projects
 /generating dataset for langsmith
+gateway_errors.log

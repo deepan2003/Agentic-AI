@@ -22,7 +22,7 @@ def update_knowledge_endpoint():
     captured_stdout = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured_stdout):
-            print("⏳ [Pipeline] Initializing S3 connection parameters...", flush=True)
+            print("⏳ [Pipeline] Initializing cloud storage connection parameters...", flush=True)
             build_local_vector_db()
             print("✅ [Pipeline] Vector index hot-swapped and live in active memory.", flush=True)
 
@@ -96,4 +96,5 @@ def chat_endpoint():
         }), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5060, debug=False)
+    port = int(os.environ.get("PORT", 5060))
+    app.run(host="0.0.0.0", port=port, debug=False)

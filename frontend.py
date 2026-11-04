@@ -10,8 +10,10 @@ st.set_page_config(page_title="Agentic RAG Gateway", page_icon="🤖", layout="w
 st.title("🤖 Intelligent Enterprise RAG Gateway")
 st.caption("Powered by Smart LLM Routing Engine & Cross-Provider Fallbacks")
 
-FLASK_API_URL = "http://127.0.0.1:5060/api/chat"
-UPDATE_API_URL = "http://127.0.0.1:5060/api/update_knowledge"
+# Detect backend URL from environment (for Render deployment) or fallback to localhost
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5060")
+FLASK_API_URL = f"{BACKEND_URL}/api/chat"
+UPDATE_API_URL = f"{BACKEND_URL}/api/update_knowledge"
 
 # --- USER IDENTIFICATION SYSTEM (LOCKED STATE) ---
 st.sidebar.title("👤 User Profile")
@@ -115,12 +117,12 @@ else:
 # --- Sidebar Knowledge Base Management ---
 st.sidebar.markdown("---")
 st.sidebar.title("🧠 Core Knowledge Management")
-st.sidebar.caption("Sync external documents from AWS S3 into your active vector indexes.")
+st.sidebar.caption("Sync external documents from Cloud Storage into your active vector indexes.")
 
-if st.sidebar.button("🔄 Sync S3 Assets to RAG System"):
+if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
     pipeline_container = st.empty()
     
-    with pipeline_container.status("🛸 Contacting secure cluster cloud storage...", expanded=True) as pipe_status:
+    with pipeline_container.status("🛸 Contacting secure cloud storage...", expanded=True) as pipe_status:
         try:
             response = requests.post(UPDATE_API_URL, timeout=300)
             
@@ -139,11 +141,11 @@ if st.sidebar.button("🔄 Sync S3 Assets to RAG System"):
                 st.sidebar.success("RAG System updated successfully!")
             else:
                 pipeline_container.empty()
-                st.sidebar.error("Failed to build vector representations from S3 resources.")
+                st.sidebar.error("Failed to build vector representations from cloud resources.")
                 
         except requests.exceptions.ConnectionError:
             pipeline_container.empty()
-            st.sidebar.error("Connection Error: Check if Flask backend is alive on port 5050.")
+            st.sidebar.error("Connection Error: Check if Flask backend is alive.")
 
 
 # --- Sidebar Cost Tracker Panel ---
@@ -215,4 +217,4 @@ if user_input := st.chat_input("Ask a question or request a technical function..
                     
             except requests.exceptions.ConnectionError:
                 loading_container.empty()
-                response_placeholder.error("Critical Connection Error: Ensure Flask server is active on Port 5060.")
+                response_placeholder.error("Critical Connection Error: Ensure Flask server is active.")

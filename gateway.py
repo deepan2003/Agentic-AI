@@ -2,6 +2,9 @@ import os
 import re
 from llm_gateway import smart_gateway
 
+# Use a relative path for the error log instead of hardcoded EC2 path
+ERROR_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateway_errors.log")
+
 def verify_user_input(user_query: str) -> str:
     """
     Scans user input for prompt injection, malicious intent, or highly sensitive 
@@ -40,7 +43,7 @@ def verify_user_input(user_query: str) -> str:
         
         decision = response.content.strip().upper()
         print(f"[Gateway Guard DEBUG] Raw decision from model: '{decision}'")
-        with open("/home/ubuntu/Agentic-AI/gateway_errors.log", "a") as f:
+        with open(ERROR_LOG_PATH, "a") as f:
             f.write(f"DEBUG raw decision: '{decision}'\n")
         
         if "BLOCK" in decision:
@@ -52,7 +55,7 @@ def verify_user_input(user_query: str) -> str:
     except Exception as e:
         error_msg = f"[Gateway Guard Critical Error] {str(e)}"
         print(error_msg)
-        with open("/home/ubuntu/Agentic-AI/gateway_errors.log", "a") as f:
+        with open(ERROR_LOG_PATH, "a") as f:
             f.write(error_msg + "\n")
         return "SECURITY_BLOCK"
 

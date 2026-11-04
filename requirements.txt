@@ -10,7 +10,7 @@ pydantic
 beautifulsoup4
 requests
 faiss-cpu
-boto3
+cloudinary
 python-dotenv
 pypdf
 langchain-text-splitters
@@ -20,3 +20,6 @@ e2b_code_interpreter
 flask
 flask_cors
 streamlit
+gunicorn
+
+gunicorn
