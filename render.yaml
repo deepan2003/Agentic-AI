@@ -3,7 +3,7 @@ services:
     name: agentic-rag-system
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && pip install --no-cache-dir -r requirements.txt
     startCommand: bash start.sh
     envVars:
       - key: PYTHON_VERSION

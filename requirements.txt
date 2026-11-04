@@ -21,5 +21,3 @@ flask
 flask_cors
 streamlit
 gunicorn
-
-gunicorn
