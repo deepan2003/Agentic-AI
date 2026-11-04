@@ -3,8 +3,16 @@ from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 
 VECTOR_DB_PATH = "./vector_store/research_papers"
-print("[System] Pre-loading HuggingFace embedding weights into RAM...")
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+_embeddings = None
+
+def get_embeddings():
+    """Lazy-load embedding model only when needed to prevent high memory usage at startup."""
+    global _embeddings
+    if _embeddings is None:
+        print("[System] Loading HuggingFace embedding weights into RAM...", flush=True)
+        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return _embeddings
+
 def query_local_research_papers(query_str: str, top_k: int = 3) -> list:
     """
     Searches the internal local vector database for research papers and academic context.
@@ -13,7 +21,8 @@ def query_local_research_papers(query_str: str, top_k: int = 3) -> list:
         return [{"error": "Local vector database not found."}]
         
     try:
-        # Load the local database using the globally cached embeddings
+        # Load the local database using lazy-loaded embeddings
+        embeddings = get_embeddings()
         vector_db = FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization=True)
         
         # Search for the best matches

@@ -15,6 +15,11 @@ from main import agent_system
 app = Flask(__name__)
 CORS(app) 
 
+@app.route("/", methods=["GET"])
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok", "service": "Agentic RAG Backend"}), 200
+
 @app.route("/api/update_knowledge", methods=["POST"])
 def update_knowledge_endpoint():
     print("\n====== 🔄 KNOWLEDGE BASE UPDATE REQUESTED ======", flush=True)
@@ -96,5 +101,6 @@ def chat_endpoint():
         }), 500
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5060))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    flask_port = int(os.environ.get("FLASK_PORT", 5060))
+    print(f"Starting Flask backend on port {flask_port}...", flush=True)
+    app.run(host="0.0.0.0", port=flask_port, debug=False)
