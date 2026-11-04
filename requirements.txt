@@ -13,6 +13,7 @@ beautifulsoup4
 requests
 faiss-cpu
 cloudinary
+python-docx
 python-dotenv
 pypdf
 langchain-text-splitters

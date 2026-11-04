@@ -14,6 +14,7 @@ st.caption("Powered by Smart LLM Routing Engine & Cross-Provider Fallbacks")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5060")
 FLASK_API_URL = f"{BACKEND_URL}/api/chat"
 UPDATE_API_URL = f"{BACKEND_URL}/api/update_knowledge"
+STORAGE_STATUS_URL = f"{BACKEND_URL}/api/storage_status"
 
 # --- USER IDENTIFICATION SYSTEM (LOCKED STATE) ---
 st.sidebar.title("👤 User Profile")
@@ -44,10 +45,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # --- DAILY RESET LOGIC ---
-# Grab the real-world current date string (YYYY-MM-DD)
 current_date = datetime.now().strftime("%Y-%m-%d")
 
-# If calendar date rolls over into a new day, clear out prior execution history
 if "cost_date" not in st.session_state or st.session_state.cost_date != current_date:
     st.session_state.cost_history = []
     st.session_state.cost_date = current_date
@@ -74,7 +73,6 @@ if saved_files:
     for file_name in saved_files:
         file_path = os.path.join(PROJECTS_DIR, file_name)
         
-        # Create side-by-side columns: 80% width for document link, 20% width for 'X' mark
         col_doc, col_del = st.sidebar.columns([4, 1])
         
         with open(file_path, "rb") as file_data:
@@ -86,7 +84,6 @@ if saved_files:
                 use_container_width=True
             )
         
-        # Place the small inline 'X' button in the second column
         if col_del.button("❌", key=f"del_btn_{file_name}", help=f"Delete {file_name}"):
             st.session_state.file_to_delete = file_name
             st.rerun()
@@ -120,29 +117,61 @@ st.sidebar.markdown("---")
 st.sidebar.title("🧠 Core Knowledge Management")
 st.sidebar.caption("Sync external documents from Cloud Storage into your active vector indexes.")
 
+# Fetch real-time Cloudinary file list
+with st.sidebar.expander("☁️ Cloud Storage Files (Cloudinary)", expanded=False):
+    try:
+        status_res = requests.get(STORAGE_STATUS_URL, timeout=5)
+        if status_res.status_code == 200:
+            storage_data = status_res.json()
+            cloud_files = storage_data.get("cloud_files", [])
+            index_ready = storage_data.get("vector_index_ready", False)
+            
+            if cloud_files:
+                st.write(f"**Found {len(cloud_files)} file(s) in Cloudinary:**")
+                for cf in cloud_files:
+                    size_kb = cf.get("bytes", 0) / 1024
+                    st.write(f"- 📄 `{cf['filename']}` ({size_kb:.1f} KB)")
+            else:
+                st.warning("⚠️ No files in Cloudinary folder `agentic-rag-data`. Upload your PDFs to Cloudinary first.")
+                
+            st.markdown(f"**Vector DB Index Status:** {'🟢 Ready' if index_ready else '🔴 Empty / Not built'}")
+        else:
+            st.info("Storage status unavailable.")
+    except Exception:
+        st.info("Connect backend to view Cloudinary file list.")
+
 if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
     pipeline_container = st.empty()
     
-    with pipeline_container.status("🛸 Contacting secure cloud storage...", expanded=True) as pipe_status:
+    with pipeline_container.status("🛸 Connecting to Cloudinary storage...", expanded=True) as pipe_status:
         try:
             response = requests.post(UPDATE_API_URL, timeout=300)
             
             if response.status_code == 200:
                 result = response.json()
                 pipeline_logs = result.get("logs", [])
+                is_success = result.get("success", False)
+                message = result.get("message", "")
+                file_count = result.get("file_count", 0)
                 
                 for log_line in pipeline_logs:
                     pipe_status.update(label=f"🔄 Processing: {log_line}")
                     st.write(f"✔️ {log_line}")
-                    time.sleep(0.3)
+                    time.sleep(0.2)
                 
-                pipe_status.update(label="✅ Knowledge Base Update Complete!", state="complete")
-                time.sleep(1.5)
-                pipeline_container.empty()
-                st.sidebar.success("RAG System updated successfully!")
+                if is_success and file_count > 0:
+                    pipe_status.update(label="✅ Knowledge Base Update Complete!", state="complete")
+                    time.sleep(1.5)
+                    pipeline_container.empty()
+                    st.sidebar.success(f"Success! {file_count} document(s) indexed into RAG.")
+                else:
+                    pipe_status.update(label="⚠️ Sync Finished: No Files Found", state="complete")
+                    time.sleep(1.5)
+                    pipeline_container.empty()
+                    st.sidebar.warning(f"⚠️ {message}")
             else:
                 pipeline_container.empty()
-                st.sidebar.error("Failed to build vector representations from cloud resources.")
+                st.sidebar.error("Failed to sync cloud resources.")
                 
         except requests.exceptions.ConnectionError:
             pipeline_container.empty()

@@ -7,7 +7,7 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from sub_agents import hybrid_research_worker
 from llm_gateway import smart_gateway
-from tools.file_system import save_file_to_disk
+from tools.file_system import save_file_to_disk, clean_document_content
 from gateway import verify_user_input, verify_agent_output
 
 load_dotenv()
@@ -101,8 +101,11 @@ def main_orchestrator_node(state: AgentState):
             ext = ext_match.group(1) if ext_match else "txt"
             filename = f"{base_name}.{ext}"
 
+        # Clean content so that raw code blocks/Python boilerplate are not saved into text/word documents
+        clean_text = clean_document_content(previous_agent_text)
+
         # Physically execute the save tool directly to write file to projects/ folder!
-        save_result = save_file_to_disk.invoke({"filename": filename, "content": previous_agent_text})
+        save_result = save_file_to_disk.invoke({"filename": filename, "content": clean_text})
         print(f"[Main Agent] Physical file saved to disk: {save_result}")
 
         system_instruction = (
