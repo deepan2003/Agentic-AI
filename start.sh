@@ -10,3 +10,4 @@ sleep 3
 # Start Streamlit frontend on Render's public $PORT
 echo "🚀 Starting Streamlit Frontend on port $PORT..."
 streamlit run frontend.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --browser.gatherUsageStats false
+
