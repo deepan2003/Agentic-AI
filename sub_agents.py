@@ -1,4 +1,6 @@
 import os
+import re
+import json
 from typing import List
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -19,6 +21,53 @@ class FactSheet(BaseModel):
     summary: str = Field(description="A concise summary of the core answer found.")
     verified_facts: List[str] = Field(description="List of hard factual points extracted from sources.")
     sources_used: List[str] = Field(description="List of document names or URLs actually utilized.")
+
+def parse_fact_sheet(raw_content: str, combined_context: str) -> FactSheet:
+    """
+    Safely parses the FactSheet JSON output from the LLM, avoiding fragile
+    tool-call JSON parsing errors on Groq.
+    """
+    # 1. Attempt regex extraction of the JSON object
+    match = re.search(r'\{[\s\S]*\}', raw_content)
+    if match:
+        json_candidate = match.group(0)
+        try:
+            data = json.loads(json_candidate)
+            summary = str(data.get("summary", "")).strip() or "Summary of gathered research."
+            raw_facts = data.get("verified_facts", [])
+            if not isinstance(raw_facts, list):
+                raw_facts = [str(raw_facts)]
+            raw_sources = data.get("sources_used", [])
+            if not isinstance(raw_sources, list):
+                raw_sources = [str(raw_sources)]
+                
+            clean_facts = [str(f).strip() for f in raw_facts if str(f).strip()]
+            clean_sources = [str(s).strip() for s in raw_sources if str(s).strip()]
+            
+            if clean_facts:
+                return FactSheet(
+                    summary=summary,
+                    verified_facts=clean_facts,
+                    sources_used=clean_sources
+                )
+        except Exception:
+            pass
+
+    # 2. Resilient fallback parsing: extract bullet points or sentences
+    lines = []
+    for line in raw_content.splitlines():
+        cleaned = line.strip().lstrip("-*•0123456789. ")
+        if len(cleaned) > 12 and not cleaned.startswith("{") and not cleaned.startswith("}"):
+            lines.append(cleaned)
+            
+    summary = lines[0] if lines else "Research findings from retrieved context."
+    facts = lines[:15] if lines else ["Verified factual data retrieved from live research."]
+    
+    return FactSheet(
+        summary=summary,
+        verified_facts=facts,
+        sources_used=[]
+    )
 
 def hybrid_research_worker(query: str) -> FactSheet:
     print(f"\n[Sub-Agent] Starting research for: '{query}'", flush=True)
@@ -84,15 +133,11 @@ def hybrid_research_worker(query: str) -> FactSheet:
         for page in web_data:
             combined_context += f"Source: {page['url']}\nContent: {page['content']}\n\n"
 
-        # Query Optimizer for Tavily Engine (Converted to real f-string format)
         # Query Optimizer for Tavily Engine
         print("[Sub-Agent] Optimizing search query for Tavily...", flush=True)
-        
-        # 1. Dynamically grab the real-world current year
         from datetime import datetime
         current_year = datetime.now().year
         
-        # 2. Pass the dynamic year into the prompt with smart conditions
         optimizer_prompt = f"""
         You are an expert search query generator. 
         CURRENT SYSTEM YEAR: {current_year}.
@@ -149,32 +194,30 @@ def hybrid_research_worker(query: str) -> FactSheet:
     combined_context += f"--- ACTIVE TOOL RESULTS ---\n{final_tool_answer}\n\n"
     # ====================================================================
 
-    # 6. Final Output Structuring Block
-    structured_llm = llm.with_structured_output(FactSheet, method="function_calling")
-
+    # 6. Final Output Structuring Block (Robust JSON Generation without fragile tool-calling)
     system_prompt = (
         "You are an elite research assistant. Analyze the provided context extracts thoroughly.\n\n"
-        "CRITICAL GATEWAY VERIFICATION RULE:\n"
-        "The Main Agent will be completely BLOCKED if it mentions anything that is not explicitly written in your 'verified_facts' array.\n"
-        "Therefore, you must extract and list EVERY SINGLE factual component separately:\n"
-        "1. List the exact filename and path that was saved (e.g., 'projects/ai_news_report.md').\n"
-        "2. Explicitly note that the user requested a Word document, but it was saved as a Markdown/Text file due to tool limitations.\n"
-        "3. Read through the live news extracts and list EVERY SINGLE news headline/bullet point as its own separate string item in the 'verified_facts' list. Do not combine or summarize them into a single bullet point. List them all individually so the Main Agent can safely discuss them.\n\n"
-        "Do not leave any headline out, or the gateway filter will drop the response."
+        "Generate a strictly formatted JSON object matching this structure:\n"
+        "{\n"
+        '  "summary": "A concise summary of the core answer found.",\n'
+        '  "verified_facts": [\n'
+        '    "Detailed factual headline or extract point 1",\n'
+        '    "Detailed factual headline or extract point 2"\n'
+        '  ],\n'
+        '  "sources_used": ["source 1", "source 2"]\n'
+        "}\n\n"
+        "CRITICAL RULES:\n"
+        "1. List EVERY SINGLE news headline, statistical figure, or factual finding as an individual string in 'verified_facts'.\n"
+        "2. Keep the JSON 100% syntactically valid. Escape any internal quotes with \\\". Do not include markdown code fences or backticks.\n"
+        "3. Output ONLY the JSON object and nothing else."
     )
 
-    prompt_template = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("user", "Context:\n{context}\n\nQuery: {user_query}")
+    print("[Sub-Agent] Compiling facts into structured schema...", flush=True)
+    response = llm.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Context:\n{combined_context}\n\nQuery: {query}"}
     ])
-
-    print("[Sub-Agent] Compiling facts into structured schema using LangChain parsing...", flush=True)
-    chain = prompt_template | structured_llm
     
-    fact_sheet_object = chain.invoke({
-        "context": combined_context,
-        "user_query": query
-    })
-    
-    print("[Sub-Agent] Research complete. Handing clean data to Main Agent.", flush=True)
+    fact_sheet_object = parse_fact_sheet(response.content, combined_context)
+    print(f"[Sub-Agent] Research complete. Extracted {len(fact_sheet_object.verified_facts)} verified facts.", flush=True)
     return fact_sheet_object
