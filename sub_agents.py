@@ -26,7 +26,7 @@ def hybrid_research_worker(query: str) -> FactSheet:
     # 1. Initialize Groq LLM early for internal evaluations
     llm = ChatOpenAI(
         base_url="https://api.groq.com/openai/v1",
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         api_key=os.getenv("GROQ_API_KEY"),
         temperature=0.0
     )

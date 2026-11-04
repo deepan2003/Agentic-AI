@@ -38,7 +38,7 @@ def verify_user_input(user_query: str) -> str:
         # If Groq fails here, the gateway will automatically use Gemini to run the safety scan!
         response = smart_gateway.completion(
             messages=[{"role": "user", "content": guard_prompt}],
-            override_model="llama-3.1-8b-instant"
+            override_model="openai/gpt-oss-20b"
         )
         
         decision = response.content.strip().upper()
@@ -65,7 +65,7 @@ def verify_agent_output(agent_response: str, verified_facts: list) -> str:
     Scans the generated agent response to ensure it sticks strictly to the facts 
     and does not hallucinate unverified information.
     """
-    print("[Gateway] Cross-checking final answer against ver ified facts...")
+    print("[Gateway] Cross-checking final answer against verified facts...")
     
     facts_summary = ", ".join(verified_facts) if verified_facts else "No facts provided."
     
@@ -82,7 +82,7 @@ def verify_agent_output(agent_response: str, verified_facts: list) -> str:
     try:
         response = smart_gateway.completion(
             messages=[{"role": "user", "content": verification_prompt}],
-            override_model="llama-3.1-8b-instant"
+            override_model="openai/gpt-oss-20b"
         )
         return response.content.strip()
     except Exception as e:

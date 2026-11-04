@@ -19,7 +19,7 @@ class AgentState(TypedDict):
 # 2. Initialize the Groq LLM engine for the Main Manager
 llm = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
-    model="llama-3.1-8b-instant",
+    model="openai/gpt-oss-20b",
     api_key=os.getenv("GROQ_API_KEY"),
     temperature=0.2
 )
@@ -53,7 +53,7 @@ def main_orchestrator_node(state: AgentState):
     # Force the small model choice since routing is a lightweight, low-cost task
     intent_response = smart_gateway.completion(
         messages=[{"role": "user", "content": router_prompt}], 
-        override_model="llama-3.1-8b-instant"
+        override_model="openai/gpt-oss-20b"
     )
     intent = intent_response.content.strip().upper()
     

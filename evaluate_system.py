@@ -12,7 +12,7 @@ load_dotenv()
 # 1. Initialize the Judge LLM
 judge_llm = ChatOpenAI(
     base_url="https://api.groq.com/openai/v1",
-    model="llama-3.3-70b-versatile",
+    model="openai/gpt-oss-120b",
     api_key=os.getenv("GROQ_API_KEY"),
     temperature=0.0
 )

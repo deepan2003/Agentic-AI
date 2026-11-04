@@ -7,9 +7,9 @@ from langchain_openai import ChatOpenAI
 
 # Cost tracking configuration per 1M tokens (Approximate values for demonstration)
 PRICING_TIERS = {
-    "llama-3.1-8b-instant": {"input": 0.05, "output": 0.08},
-    "llama-3.3-70b-versatile": {"input": 0.59, "output": 0.79},
-    "gemini-3.5-flash": {"input": 0.075, "output": 0.30} # UPDATED TO ACTIVE MODEL
+    "openai/gpt-oss-20b": {"input": 0.05, "output": 0.08},
+    "openai/gpt-oss-120b": {"input": 0.59, "output": 0.79},
+    "gemini-1.5-flash": {"input": 0.075, "output": 0.30}
 }
 
 class SmartLLMGateway:
@@ -36,9 +36,9 @@ class SmartLLMGateway:
         prompt_lower = prompt.lower()
         # Hard tasks: Code execution, complex reasoning, system building
         if any(keyword in prompt_lower for keyword in ["code", "def ", "class ", "import ", "calculate", "math"]):
-            return "llama-3.3-70b-versatile"
+            return "openai/gpt-oss-120b"
         # Cheap tasks: Summarization, routing, chit-chat, greetings
-        return "llama-3.1-8b-instant"
+        return "openai/gpt-oss-20b"
 
     def _track_cost(self, model_name: str, input_tokens: int, output_tokens: int):
         """Pillar 4: Automatically log usage costs dynamically."""
@@ -63,9 +63,7 @@ class SmartLLMGateway:
         Logs the Cost of the tokens used.
 
         Fallback: If Groq fails or crashes, it automatically switches to 
-        the Gemini API (gemini-3.5-flash) so the user never sees an error.
-                
-        
+        the Gemini API (gemini-1.5-flash) so the user never sees an error.
         """
         self.execution_logs = []
         self.total_queries += 1
@@ -88,8 +86,8 @@ class SmartLLMGateway:
         # Setup primary configuration parameters
         models_to_try = [
             {"model": target_model, "base_url": "https://api.groq.com/openai/v1", "api_key": current_key},
-            # Pillar 2: Invisible Fallback Target if primary provider fails (UPDATED TO ACTIVE MODEL)
-            {"model": "gemini-3.5-flash", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "api_key": os.getenv("GEMINI_API_KEY")}
+            # Pillar 2: Invisible Fallback Target if primary provider fails
+            {"model": "gemini-1.5-flash", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "api_key": os.getenv("GEMINI_API_KEY")}
         ]
 
         for attempt in models_to_try:
