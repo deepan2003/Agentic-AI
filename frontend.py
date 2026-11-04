@@ -15,6 +15,7 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5060")
 FLASK_API_URL = f"{BACKEND_URL}/api/chat"
 UPDATE_API_URL = f"{BACKEND_URL}/api/update_knowledge"
 STORAGE_STATUS_URL = f"{BACKEND_URL}/api/storage_status"
+UPLOAD_PDF_URL = f"{BACKEND_URL}/api/upload_pdf"
 
 # --- USER IDENTIFICATION SYSTEM (LOCKED STATE) ---
 st.sidebar.title("👤 User Profile")
@@ -28,16 +29,13 @@ if not st.session_state.thread_id:
     user_id_input = st.sidebar.text_input("Enter your Username / Employee ID:")
     
     if user_id_input:
-        # Once they press Enter, save the ID, clear history, and reload!
         st.session_state.thread_id = user_id_input
         st.session_state.messages = [] 
         st.rerun() 
     else:
-        # Halt execution until they provide an ID
         st.warning("👈 Please enter your Username in the sidebar to securely connect to your personal chat history thread.")
         st.stop()
 else:
-    # If they ARE logged in, hide the input box and show uneditable text
     st.sidebar.success(f"Verified User: **{st.session_state.thread_id}**")
 
 
@@ -64,7 +62,6 @@ if not os.path.exists(PROJECTS_DIR):
 # Exclude internal rulebook agent.md from downloadable user documents
 saved_files = [f for f in os.listdir(PROJECTS_DIR) if os.path.isfile(os.path.join(PROJECTS_DIR, f)) and f != "agent.md"]
 
-# Track which file is pending deletion across refreshes
 if "file_to_delete" not in st.session_state:
     st.session_state.file_to_delete = None
 
@@ -88,7 +85,6 @@ if saved_files:
             st.session_state.file_to_delete = file_name
             st.rerun()
 
-    # Handle the Confirmation Step directly beneath the file layout
     if st.session_state.file_to_delete:
         target_file = st.session_state.file_to_delete
         st.sidebar.markdown("---")
@@ -115,35 +111,73 @@ else:
 # --- Sidebar Knowledge Base Management ---
 st.sidebar.markdown("---")
 st.sidebar.title("🧠 Core Knowledge Management")
-st.sidebar.caption("Sync external documents from Cloud Storage into your active vector indexes.")
+st.sidebar.caption("Upload or sync PDF documents directly into active vector indexes.")
 
-# Fetch real-time Cloudinary file list
-with st.sidebar.expander("☁️ Cloud Storage Files (Cloudinary)", expanded=False):
-    try:
-        status_res = requests.get(STORAGE_STATUS_URL, timeout=5)
-        if status_res.status_code == 200:
-            storage_data = status_res.json()
-            cloud_files = storage_data.get("cloud_files", [])
-            index_ready = storage_data.get("vector_index_ready", False)
-            
-            if cloud_files:
-                st.write(f"**Found {len(cloud_files)} file(s) in Cloudinary:**")
-                for cf in cloud_files:
-                    size_kb = cf.get("bytes", 0) / 1024
-                    st.write(f"- 📄 `{cf['filename']}` ({size_kb:.1f} KB)")
-            else:
-                st.warning("⚠️ No files in Cloudinary folder `agentic-rag-data`. Upload your PDFs to Cloudinary first.")
-                
-            st.markdown(f"**Vector DB Index Status:** {'🟢 Ready' if index_ready else '🔴 Empty / Not built'}")
+# 1. Direct In-App PDF Upload (Instantly displays in frontend without page refresh)
+uploaded_pdf = st.sidebar.file_uploader(
+    "📤 Upload PDF to Knowledge Base", 
+    type=["pdf"], 
+    key="knowledge_pdf_uploader",
+    help="Upload research papers or documents to immediately ground agent responses."
+)
+
+if uploaded_pdf is not None:
+    # Process only if this file hasn't been uploaded in current session
+    if "last_indexed_pdf" not in st.session_state or st.session_state.last_indexed_pdf != uploaded_pdf.name:
+        with st.sidebar.status(f"⚙️ Indexing '{uploaded_pdf.name}' into RAG..."):
+            try:
+                files = {"file": (uploaded_pdf.name, uploaded_pdf.getvalue(), "application/pdf")}
+                up_res = requests.post(UPLOAD_PDF_URL, files=files, timeout=120)
+                if up_res.status_code == 200:
+                    res_data = up_res.json()
+                    st.sidebar.success(f"✅ Indexed '{uploaded_pdf.name}' ({res_data.get('chunks', 0)} chunks)!")
+                    st.session_state.last_indexed_pdf = uploaded_pdf.name
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.sidebar.error("Failed to index PDF.")
+            except Exception as e:
+                st.sidebar.error(f"Error processing PDF upload: {e}")
+
+# Fetch real-time storage and index status
+try:
+    status_res = requests.get(STORAGE_STATUS_URL, timeout=5)
+    if status_res.status_code == 200:
+        storage_data = status_res.json()
+        uploaded_pdfs = storage_data.get("uploaded_pdfs", [])
+        cloud_files = storage_data.get("cloud_files", [])
+        index_ready = storage_data.get("vector_index_ready", False)
+
+        # 2. Live Knowledge Base Files List (Updates automatically!)
+        st.sidebar.markdown("#### 📚 Active Knowledge Base Files")
+        if uploaded_pdfs:
+            for up in uploaded_pdfs:
+                st.sidebar.markdown(f"- 📄 **`{up['filename']}`** ({up['size_kb']} KB)")
+        elif cloud_files:
+            for cf in cloud_files:
+                size_kb = cf.get("bytes", 0) / 1024
+                st.sidebar.markdown(f"- 📄 **`{cf['filename']}`** ({size_kb:.1f} KB)")
         else:
-            st.info("Storage status unavailable.")
-    except Exception:
-        st.info("Connect backend to view Cloudinary file list.")
+            st.sidebar.warning("⚠️ No documents indexed yet. Use the upload box above to add your first PDF!")
 
+        st.sidebar.markdown(f"**Vector Store Status:** {'🟢 Active & Loaded' if index_ready else '🔴 Empty / Waiting for PDF'}")
+
+        # Cloud storage view expander
+        with st.sidebar.expander("☁️ Cloud Storage (Cloudinary)", expanded=False):
+            if cloud_files:
+                st.write(f"**{len(cloud_files)} file(s) in Cloudinary:**")
+                for cf in cloud_files:
+                    st.write(f"- `{cf['filename']}` ({cf.get('bytes', 0)/1024:.1f} KB)")
+            else:
+                st.caption("No files currently detected in Cloudinary folder `agentic-rag-data`.")
+except Exception:
+    st.sidebar.caption("Backend offline: cannot check knowledge status.")
+
+# 3. Cloudinary Sync Button
 if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
     pipeline_container = st.empty()
     
-    with pipeline_container.status("🛸 Connecting to Cloudinary storage...", expanded=True) as pipe_status:
+    with pipeline_container.status("🛸 Connecting to storage...", expanded=True) as pipe_status:
         try:
             response = requests.post(UPDATE_API_URL, timeout=300)
             
@@ -164,6 +198,7 @@ if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
                     time.sleep(1.5)
                     pipeline_container.empty()
                     st.sidebar.success(f"Success! {file_count} document(s) indexed into RAG.")
+                    st.rerun()
                 else:
                     pipe_status.update(label="⚠️ Sync Finished: No Files Found", state="complete")
                     time.sleep(1.5)

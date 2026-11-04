@@ -1,6 +1,7 @@
 import os
 import cloudinary
 import cloudinary.api
+import cloudinary.uploader
 import requests as http_requests
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -22,11 +23,92 @@ cloudinary.config(
 CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "agentic-rag-data")
 VECTOR_DB_PATH = "./vector_store/research_papers"
 TMP_DIR = "./tmp_downloads"
+UPLOAD_DIR = "./data_uploads"
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(VECTOR_DB_PATH, exist_ok=True)
+
+def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
+    """
+    Saves an uploaded PDF to data_uploads, extracts chunks,
+    and updates the active local FAISS vector index immediately.
+    Also backs up the file to Cloudinary if available.
+    """
+    safe_name = os.path.basename(filename)
+    dest_path = os.path.join(UPLOAD_DIR, safe_name)
+    with open(dest_path, "wb") as f:
+        f.write(file_bytes)
+        
+    print(f"[Knowledge Engine] Indexing newly uploaded PDF: {safe_name}...", flush=True)
+
+    # Optional background backup to Cloudinary
+    try:
+        cloudinary.uploader.upload(
+            dest_path,
+            folder=CLOUDINARY_FOLDER,
+            resource_type="raw",
+            public_id=safe_name
+        )
+        print(f"[Knowledge Engine] Backed up {safe_name} to Cloudinary folder '{CLOUDINARY_FOLDER}'.", flush=True)
+    except Exception as e:
+        print(f"[Knowledge Engine Info] Cloudinary cloud backup: {e}")
+
+    # Process and build/update FAISS index
+    try:
+        loader = PyPDFLoader(dest_path)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        docs = loader.load_and_split(text_splitter)
+        
+        if not docs:
+            return {"success": False, "message": "No readable text found in PDF", "chunks": 0}
+
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        index_file = os.path.join(VECTOR_DB_PATH, "index.faiss")
+        
+        if os.path.exists(index_file):
+            try:
+                vector_db = FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization=True)
+                vector_db.add_documents(docs)
+                vector_db.save_local(VECTOR_DB_PATH)
+            except Exception:
+                vector_db = FAISS.from_documents(docs, embeddings)
+                vector_db.save_local(VECTOR_DB_PATH)
+        else:
+            vector_db = FAISS.from_documents(docs, embeddings)
+            vector_db.save_local(VECTOR_DB_PATH)
+
+        return {
+            "success": True,
+            "filename": safe_name,
+            "chunks": len(docs),
+            "message": f"Successfully indexed '{safe_name}' with {len(docs)} text chunks."
+        }
+    except Exception as err:
+        print(f"[Knowledge Engine Error] Processing PDF failed: {err}", flush=True)
+        return {
+            "success": False,
+            "filename": safe_name,
+            "chunks": 0,
+            "message": f"Failed to extract text from PDF: {str(err)}"
+        }
+
+def list_uploaded_pdfs() -> list:
+    """Lists all PDFs currently saved and indexed in the knowledge base."""
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    files = []
+    for f in os.listdir(UPLOAD_DIR):
+        if f.lower().endswith(".pdf"):
+            full = os.path.join(UPLOAD_DIR, f)
+            files.append({
+                "filename": f,
+                "size_kb": round(os.path.getsize(full) / 1024, 1),
+                "modified": os.path.getmtime(full)
+            })
+    return sorted(files, key=lambda x: x["modified"], reverse=True)
 
 def list_cloud_storage_files():
     """
     Queries Cloudinary and returns a list of files available in the storage folder.
-    Checks both 'raw' and 'image' resource types since Cloudinary sometimes classifies PDFs as images.
     """
     found_files = []
     
@@ -52,7 +134,7 @@ def list_cloud_storage_files():
     except Exception as e:
         print(f"[Cloudinary Warning] Error checking raw resources: {e}")
 
-    # 2. Check image resources (for PDFs uploaded as document/image)
+    # 2. Check image resources
     try:
         res_img = cloudinary.api.resources(
             type="upload",
@@ -80,7 +162,7 @@ def list_cloud_storage_files():
     return found_files
 
 def download_papers_from_cloudinary():
-    """Downloads all raw and PDF files from Cloudinary folder into a temporary local folder."""
+    """Downloads all raw and PDF files from Cloudinary folder into local uploads."""
     print(f"Connecting to Cloudinary Cloud Storage (folder: '{CLOUDINARY_FOLDER}')...", flush=True)
     
     if not os.path.exists(TMP_DIR):
@@ -88,7 +170,7 @@ def download_papers_from_cloudinary():
         
     cloud_files = list_cloud_storage_files()
     if not cloud_files:
-        print(f"⚠️ No files found in Cloudinary folder '{CLOUDINARY_FOLDER}'! Please upload PDF files first.", flush=True)
+        print(f"⚠️ No files found in Cloudinary folder '{CLOUDINARY_FOLDER}'.", flush=True)
         return []
         
     downloaded_files = []
@@ -112,42 +194,53 @@ def download_papers_from_cloudinary():
     return downloaded_files
 
 def build_local_vector_db():
-    """Reads downloaded PDFs, chunks text, creates embeddings, and saves FAISS index."""
-    raw_files = download_papers_from_cloudinary()
-    if not raw_files:
-        print("❌ Pipeline stopped: 0 research files were found in Cloudinary.", flush=True)
+    """Reads all PDFs from uploads and Cloudinary, chunks text, and saves FAISS index."""
+    # First, pull any files from Cloudinary into TMP_DIR
+    download_papers_from_cloudinary()
+    
+    # Collect all PDFs from TMP_DIR and UPLOAD_DIR
+    all_pdf_paths = []
+    if os.path.exists(TMP_DIR):
+        for f in os.listdir(TMP_DIR):
+            if f.lower().endswith(".pdf"):
+                all_pdf_paths.append(os.path.join(TMP_DIR, f))
+    if os.path.exists(UPLOAD_DIR):
+        for f in os.listdir(UPLOAD_DIR):
+            if f.lower().endswith(".pdf"):
+                path = os.path.join(UPLOAD_DIR, f)
+                if path not in all_pdf_paths:
+                    all_pdf_paths.append(path)
+
+    if not all_pdf_paths:
+        print("❌ Pipeline stopped: No PDF files available to index.", flush=True)
         return {
             "success": False,
             "file_count": 0,
             "files": [],
             "chunks": 0,
-            "message": f"No files found in Cloudinary folder '{CLOUDINARY_FOLDER}'. Vector database was NOT updated."
+            "message": "No PDF files found to index. Upload a PDF first."
         }
 
     all_chunks = []
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     processed_file_names = []
 
-    print(f"Processing {len(raw_files)} PDF file(s) and splitting text...", flush=True)
-    for file_path in raw_files:
-        if file_path.endswith(".pdf"):
-            try:
-                loader = PyPDFLoader(file_path)
-                docs = loader.load_and_split(text_splitter)
-                all_chunks.extend(docs)
-                base_name = os.path.basename(file_path)
-                processed_file_names.append(base_name)
-                print(f"Successfully processed PDF: {base_name} ({len(docs)} chunks)", flush=True)
-            except Exception as e:
-                print(f"Could not read PDF file {file_path}: {str(e)}", flush=True)
-        else:
-            print(f"Skipping non-PDF file: {file_path}", flush=True)
+    print(f"Processing {len(all_pdf_paths)} PDF file(s) and splitting text...", flush=True)
+    for file_path in all_pdf_paths:
+        try:
+            loader = PyPDFLoader(file_path)
+            docs = loader.load_and_split(text_splitter)
+            all_chunks.extend(docs)
+            base_name = os.path.basename(file_path)
+            processed_file_names.append(base_name)
+            print(f"Successfully processed PDF: {base_name} ({len(docs)} chunks)", flush=True)
+        except Exception as e:
+            print(f"Could not read PDF file {file_path}: {str(e)}", flush=True)
 
     if not all_chunks:
-        print("❌ No text chunks generated from the downloaded files.", flush=True)
         return {
             "success": False,
-            "file_count": len(raw_files),
+            "file_count": len(all_pdf_paths),
             "files": processed_file_names,
             "chunks": 0,
             "message": "Downloaded files contained no readable text."
@@ -160,19 +253,6 @@ def build_local_vector_db():
     vector_db = FAISS.from_documents(all_chunks, embeddings)
     vector_db.save_local(VECTOR_DB_PATH)
     print(f"✅ Success! Local vector database saved with {len(all_chunks)} chunks from {len(processed_file_names)} file(s).", flush=True)
-
-    # Clean up temporary downloads
-    for file in raw_files:
-        if os.path.exists(file):
-            try:
-                os.remove(file)
-            except Exception:
-                pass
-    if os.path.exists(TMP_DIR):
-        try:
-            os.rmdir(TMP_DIR)
-        except Exception:
-            pass
 
     return {
         "success": True,

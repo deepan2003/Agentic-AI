@@ -4,7 +4,7 @@ import contextlib
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from ingestion import build_local_vector_db, list_cloud_storage_files
+from ingestion import build_local_vector_db, list_cloud_storage_files, index_uploaded_pdf, list_uploaded_pdfs
 
 load_dotenv()
 
@@ -20,11 +20,33 @@ CORS(app)
 def health_check():
     return jsonify({"status": "ok", "service": "Agentic RAG Backend"}), 200
 
+@app.route("/api/upload_pdf", methods=["POST"])
+def upload_pdf_endpoint():
+    """Receives an uploaded PDF file, indexes it into FAISS, and backs it up."""
+    if "file" not in request.files:
+        return jsonify({"success": False, "message": "No file uploaded in request."}), 400
+        
+    uploaded_file = request.files["file"]
+    if not uploaded_file.filename:
+        return jsonify({"success": False, "message": "Empty filename."}), 400
+
+    filename = uploaded_file.filename
+    if not filename.lower().endswith(".pdf"):
+        return jsonify({"success": False, "message": "Only PDF files are supported."}), 400
+
+    file_bytes = uploaded_file.read()
+    print(f"\n====== 📄 PDF UPLOAD RECEIVED: {filename} ({len(file_bytes)} bytes) ======", flush=True)
+
+    result = index_uploaded_pdf(file_bytes, filename)
+    status_code = 200 if result.get("success") else 500
+    return jsonify(result), status_code
+
 @app.route("/api/storage_status", methods=["GET"])
 def storage_status_endpoint():
     """Returns actual files present in Cloudinary and the local FAISS index status."""
     try:
         cloud_files = list_cloud_storage_files()
+        uploaded_pdfs = list_uploaded_pdfs()
         vector_db_path = "./vector_store/research_papers"
         has_index = os.path.exists(vector_db_path) and os.path.exists(os.path.join(vector_db_path, "index.faiss"))
         
@@ -32,6 +54,8 @@ def storage_status_endpoint():
             "success": True,
             "cloud_files": cloud_files,
             "cloud_file_count": len(cloud_files),
+            "uploaded_pdfs": uploaded_pdfs,
+            "uploaded_pdf_count": len(uploaded_pdfs),
             "vector_index_ready": has_index
         }), 200
     except Exception as e:
@@ -40,6 +64,8 @@ def storage_status_endpoint():
             "error": str(e),
             "cloud_files": [],
             "cloud_file_count": 0,
+            "uploaded_pdfs": [],
+            "uploaded_pdf_count": 0,
             "vector_index_ready": False
         }), 500
 
@@ -50,7 +76,7 @@ def update_knowledge_endpoint():
     captured_stdout = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured_stdout):
-            print("⏳ [Pipeline] Checking Cloudinary storage and vector index...", flush=True)
+            print("⏳ [Pipeline] Checking storage and vector index...", flush=True)
             result = build_local_vector_db()
 
         printed_logs = [line.strip() for line in captured_stdout.getvalue().splitlines() if line.strip()]
@@ -104,13 +130,11 @@ def chat_endpoint():
 
             print(f"⏳ [Engine] Activating Agentic Orchestrator Workflow...", flush=True)
             
-            # The agent_system automatically runs the output guardrail internally!
             state_output = agent_system.invoke(
                 {"messages": [{"role": "user", "content": secure_prompt}]},
                 config=session_config
             )
             
-            # Grab the final verified answer
             final_response = state_output["messages"][-1].content
             print("✅ [System] Gateway approval verified successfully.", flush=True)
 
