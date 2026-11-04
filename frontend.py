@@ -62,7 +62,8 @@ PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
 if not os.path.exists(PROJECTS_DIR):
     os.makedirs(PROJECTS_DIR)
 
-saved_files = [f for f in os.listdir(PROJECTS_DIR) if os.path.isfile(os.path.join(PROJECTS_DIR, f))]
+# Exclude internal rulebook agent.md from downloadable user documents
+saved_files = [f for f in os.listdir(PROJECTS_DIR) if os.path.isfile(os.path.join(PROJECTS_DIR, f)) and f != "agent.md"]
 
 # Track which file is pending deletion across refreshes
 if "file_to_delete" not in st.session_state:
@@ -213,7 +214,14 @@ if user_input := st.chat_input("Ask a question or request a technical function..
                     st.rerun()
                 else:
                     loading_container.empty()
-                    response_placeholder.error("Error communicating with backend processing nodes.")
+                    err_msg = "Error communicating with backend processing nodes."
+                    try:
+                        err_json = api_response.json()
+                        if "response" in err_json:
+                            err_msg = err_json["response"]
+                    except Exception:
+                        pass
+                    response_placeholder.error(err_msg)
                     
             except requests.exceptions.ConnectionError:
                 loading_container.empty()
