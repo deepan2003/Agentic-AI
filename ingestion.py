@@ -27,7 +27,7 @@ def get_embedding_model():
                 from langchain_google_genai import GoogleGenerativeAIEmbeddings
                 print("[Knowledge Engine] Using Google Gemini Cloud Embeddings (0MB RAM)...", flush=True)
                 _ingest_embeddings = GoogleGenerativeAIEmbeddings(
-                    model="models/text-embedding-004",
+                    model="models/embedding-001",
                     google_api_key=gemini_key
                 )
                 return _ingest_embeddings

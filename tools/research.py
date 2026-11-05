@@ -19,7 +19,7 @@ def get_embeddings():
                 from langchain_google_genai import GoogleGenerativeAIEmbeddings
                 print("[System] Using Google Gemini Cloud Embeddings for research lookup (0MB RAM)...", flush=True)
                 _embeddings = GoogleGenerativeAIEmbeddings(
-                    model="models/text-embedding-004",
+                    model="models/embedding-001",
                     google_api_key=gemini_key
                 )
                 return _embeddings
