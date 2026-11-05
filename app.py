@@ -1,12 +1,32 @@
 import os
 import io
+import sys
+import threading
 import contextlib
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from ingestion import build_local_vector_db, list_cloud_storage_files, index_uploaded_pdf, list_uploaded_pdfs, delete_cloudinary_file, delete_uploaded_pdf
+from ingestion import build_local_vector_db, list_cloud_storage_files, index_uploaded_pdf, list_uploaded_pdfs, delete_cloudinary_file, delete_uploaded_pdf, get_embedding_model
 
 load_dotenv()
+
+# Dual stdout writer that outputs to server console immediately while also buffering for frontend
+class DualStream(io.StringIO):
+    def write(self, s):
+        sys.__stdout__.write(s)
+        sys.__stdout__.flush()
+        return super().write(s)
+
+# Pre-warm FastEmbed embeddings in background on startup so first user query has ZERO lag
+def _bg_prewarm():
+    try:
+        print("[Startup] ⚡ Pre-warming FastEmbed embeddings in background...", flush=True)
+        get_embedding_model()
+        print("[Startup] ✅ FastEmbed embeddings loaded and ready for immediate queries!", flush=True)
+    except Exception as e:
+        print(f"[Startup Warning] Background pre-warm notice: {e}", flush=True)
+
+threading.Thread(target=_bg_prewarm, daemon=True).start()
 
 from llm_gateway import smart_gateway
 from gateway import verify_user_input
@@ -142,7 +162,7 @@ def chat_endpoint():
         return jsonify({"response": "Empty prompt received.", "logs": []}), 400
 
     smart_gateway.execution_logs = []
-    captured_stdout = io.StringIO()
+    captured_stdout = DualStream()
 
     try:
         with contextlib.redirect_stdout(captured_stdout):

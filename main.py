@@ -55,22 +55,32 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
 
     print(f"\n[Main Agent] Analyzing request and managing context...")
     
-    # --- INTENT CLASSIFIER / ROUTER ---
-    router_prompt = (
-        "Classify the user's prompt into one of four categories: 'CHITCHAT', 'CHAT_HISTORY', 'SAVE_HISTORY', or 'RESEARCH'.\n"
-        "- Use 'CHITCHAT' for greetings, casual conversation, jokes, expressions of emotion, or simple pleasantries.\n"
-        "- Use 'CHAT_HISTORY' if the user asks what we discussed, asks to summarize our previous conversation, asks what their previous question was, or references past interactions between you and them.\n"
-        "- Use 'SAVE_HISTORY' ONLY if the user explicitly asks to save, export, or write the PREVIOUS conversation text, previous response, or chat history into a file/document.\n"
-        "- Use 'RESEARCH' if the user asks for new news, facts, uploaded PDF context, technical documentation, coding, calculations, or general questions.\n\n"
-        "Return ONLY the word 'CHITCHAT', 'CHAT_HISTORY', 'SAVE_HISTORY', or 'RESEARCH' and absolutely nothing else.\n\n"
-        f"User Prompt: {last_user_message}"
-    )
-    
-    intent_response = smart_gateway.completion(
-        messages=[{"role": "user", "content": router_prompt}], 
-        override_model="openai/gpt-oss-20b"
-    )
-    intent = intent_response.content.strip().upper()
+    # --- FAST-PATH & INTENT CLASSIFIER / ROUTER ---
+    clean_msg = last_user_message.strip().lower()
+    if clean_msg in ["hi", "hello", "hey", "good morning", "good evening", "how are you", "yo", "sup", "greetings"]:
+        intent = "CHITCHAT"
+    elif any(kw in clean_msg for kw in ["what did we discuss", "summarize our chat", "chat history", "previous message", "what was my last question", "conversation so far"]):
+        intent = "CHAT_HISTORY"
+    elif any(kw in clean_msg for kw in ["save previous", "save the chat", "save our conversation", "export chat", "save history"]):
+        intent = "SAVE_HISTORY"
+    elif any(kw in clean_msg for kw in ["resume", "cv", "pdf", "deepan", "document", "uploaded", "code", "python", "function", "who is", "what is", "how to", "search", "explain", "tell me"]):
+        intent = "RESEARCH"
+    else:
+        router_prompt = (
+            "Classify the user's prompt into one of four categories: 'CHITCHAT', 'CHAT_HISTORY', 'SAVE_HISTORY', or 'RESEARCH'.\n"
+            "- Use 'CHITCHAT' for greetings, casual conversation, jokes, expressions of emotion, or simple pleasantries.\n"
+            "- Use 'CHAT_HISTORY' if the user asks what we discussed, asks to summarize our previous conversation, asks what their previous question was, or references past interactions between you and them.\n"
+            "- Use 'SAVE_HISTORY' ONLY if the user explicitly asks to save, export, or write the PREVIOUS conversation text, previous response, or chat history into a file/document.\n"
+            "- Use 'RESEARCH' if the user asks for new news, facts, uploaded PDF context, technical documentation, coding, calculations, or general questions.\n\n"
+            "Return ONLY the word 'CHITCHAT', 'CHAT_HISTORY', 'SAVE_HISTORY', or 'RESEARCH' and absolutely nothing else.\n\n"
+            f"User Prompt: {last_user_message}"
+        )
+        
+        intent_response = smart_gateway.completion(
+            messages=[{"role": "user", "content": router_prompt}], 
+            override_model="openai/gpt-oss-20b"
+        )
+        intent = intent_response.content.strip().upper()
     
     # Route A: Conversational Path
     if "CHITCHAT" in intent:

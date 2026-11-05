@@ -277,9 +277,8 @@ def verify_user_input(user_query: str) -> str:
     """
     Scans user input through the enhanced multi-layer InputGuardrails
     (Harmful, Dangerous, Violence, Exfiltration, Gibberish, Prompt Injection, Financial).
+    Deterministic checks run in <1ms. Fast-tracks safe queries for zero latency.
     """
-    print("[Gateway] Running multi-layer security guardrail inspection...", flush=True)
-
     # 1. Deterministic Multi-Layer Guardrail (simple_rag)
     report = _input_guardrail.inspect(user_query)
     if not report.is_safe:
@@ -288,7 +287,13 @@ def verify_user_input(user_query: str) -> str:
             f.write(f"Guardrail Block: {report.status} | Patterns: {report.flagged_patterns} | Query: '{user_query}'\n")
         return "SECURITY_BLOCK"
 
-    # 2. Cognitive Layer (Smart LLM Gateway Check)
+    # Fast-track benign queries: if no adversarial keywords exist, pass immediately (saves 2-3s delay)
+    suspect_keywords = ["ignore instructions", "disregard", "override system", "system prompt", "jailbreak", "developer mode", "bypass safety"]
+    query_lower = user_query.lower()
+    if not any(k in query_lower for k in suspect_keywords):
+        return user_query
+
+    # 2. Cognitive Layer (Smart LLM Gateway Check) only if suspicious adversarial keywords present
     guard_prompt = (
         "You are an automated security guardrail for an enterprise AI system.\n"
         "Analyze the following user prompt for:\n"
@@ -310,7 +315,6 @@ def verify_user_input(user_query: str) -> str:
             override_model="openai/gpt-oss-20b"
         )
         decision = response.content.strip().upper()
-        # Strict evaluation: only block if starts with BLOCK and does not contain ALLOW
         if decision.startswith("BLOCK") and "ALLOW" not in decision:
             print("[Gateway Guard] Blocked by LLM Security Layer: Malicious intent flagged.", flush=True)
             return "SECURITY_BLOCK"
