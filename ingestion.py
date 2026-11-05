@@ -1,8 +1,10 @@
 import os
 import re
+import time
 import cloudinary
 import cloudinary.api
 import cloudinary.uploader
+import cloudinary.utils
 import requests as http_requests
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -11,6 +13,10 @@ from langchain_community.document_loaders import PyPDFLoader
 
 # 1. Load environment variables
 load_dotenv()
+
+# Cooldown tracker to prevent repeated Cloudinary 401 retry loops within the same turn
+_FAILED_SYNC_TIMESTAMPS = {}
+SYNC_COOLDOWN_SECONDS = 45
 
 def sanitize_thread_id(thread_id: str = "default") -> str:
     """Returns a safe, alphanumeric thread identifier for folders and cloud namespaces."""
@@ -121,6 +127,8 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str, thread_id: str = "defau
     """
     safe_name = os.path.basename(filename)
     safe_thread = sanitize_thread_id(thread_id)
+    _FAILED_SYNC_TIMESTAMPS.pop(safe_thread, None)
+
     user_upload_dir = get_user_upload_dir(safe_thread)
     user_vector_path = get_user_vector_path(safe_thread)
     dest_path = os.path.join(user_upload_dir, safe_name)
@@ -129,7 +137,7 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str, thread_id: str = "defau
         
     print(f"[Knowledge Engine] Indexing PDF '{safe_name}' for user '{safe_thread}'...", flush=True)
 
-    # 1. Back up to Cloudinary under user's namespace
+    # 1. Back up to Cloudinary under user's namespace as raw resource (bypasses Cloudinary PDF-as-image 401 blocks)
     user_cloud_folder = f"{CLOUDINARY_FOLDER}/{safe_thread}"
     try:
         cloudinary.uploader.upload(
@@ -139,6 +147,7 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str, thread_id: str = "defau
             public_id=safe_name,
             access_mode="public",
             type="upload",
+            overwrite=True,
             timeout=20
         )
         print(f"[Knowledge Engine] Successfully backed up {safe_name} to Cloudinary folder '{user_cloud_folder}'.", flush=True)
@@ -228,7 +237,7 @@ def list_uploaded_pdfs(thread_id: str = "default") -> list:
 
 def list_cloud_storage_files(thread_id: str = "default"):
     """
-    Queries Cloudinary and returns a list of files available in this user's storage folder.
+    Queries Cloudinary and returns a deduplicated list of files available in this user's storage folder.
     Also falls back to root folder if in default mode so legacy files are not lost.
     """
     safe_thread = sanitize_thread_id(thread_id)
@@ -260,12 +269,15 @@ def list_cloud_storage_files(thread_id: str = "default"):
                         "public_id": pub_id,
                         "bytes": r.get("bytes", 0),
                         "url": r.get("secure_url", ""),
-                        "format": r.get("format", "raw")
+                        "format": r.get("format", ""),
+                        "resource_type": "raw",
+                        "type": r.get("type", "upload"),
+                        "version": r.get("version")
                     })
         except Exception as e:
             print(f"[Cloudinary Warning] Error checking raw resources for {folder_prefix}: {e}")
 
-        # 2. Check image resources
+        # 2. Check image resources (Cloudinary often stores uploaded PDFs as resource_type='image', format='pdf')
         try:
             res_img = cloudinary.api.resources(
                 type="upload",
@@ -281,19 +293,95 @@ def list_cloud_storage_files(thread_id: str = "default"):
                 fmt = r.get("format", "")
                 if fmt == "pdf" or pub_id.lower().endswith(".pdf"):
                     name = pub_id.split("/")[-1]
-                    if not name.endswith(".pdf") and fmt:
+                    if not name.lower().endswith(".pdf") and fmt:
                         name = f"{name}.{fmt}"
                     found_files.append({
                         "filename": name,
                         "public_id": pub_id,
                         "bytes": r.get("bytes", 0),
                         "url": r.get("secure_url", ""),
-                        "format": fmt
+                        "format": fmt or "pdf",
+                        "resource_type": "image",
+                        "type": r.get("type", "upload"),
+                        "version": r.get("version")
                     })
         except Exception as e:
             print(f"[Cloudinary Warning] Error checking image resources for {folder_prefix}: {e}")
         
     return found_files
+
+def _build_cloudinary_download_candidates(item: dict) -> list:
+    """
+    Builds ordered download URL candidates for a Cloudinary resource to overcome HTTP 401 errors:
+    1. Signed private API download URL (`api.cloudinary.com/.../download`) which bypasses CDN PDF delivery restrictions.
+    2. Signed CDN delivery URL (`sign_url=True`).
+    3. Direct `secure_url`.
+    """
+    candidates = []
+    pub_id = item["public_id"]
+    res_type = item.get("resource_type") or ("image" if item.get("format") == "pdf" else "raw")
+    upload_type = item.get("type", "upload")
+    fmt = item.get("format", "")
+    version = item.get("version")
+
+    # 1. Authenticated API download URLs (bypasses Cloudinary 'Allow delivery of PDF and ZIP files' 401 restriction)
+    try:
+        if res_type == "raw":
+            dl_url = cloudinary.utils.private_download_url(
+                pub_id,
+                fmt or "",
+                resource_type="raw",
+                type=upload_type
+            )
+            if dl_url:
+                candidates.append(dl_url)
+            if pub_id.lower().endswith(".pdf"):
+                dl_url_alt = cloudinary.utils.private_download_url(
+                    pub_id[:-4],
+                    "pdf",
+                    resource_type="raw",
+                    type=upload_type
+                )
+                if dl_url_alt and dl_url_alt not in candidates:
+                    candidates.append(dl_url_alt)
+        else:
+            clean_pub_id = pub_id[:-4] if pub_id.lower().endswith(".pdf") else pub_id
+            dl_url = cloudinary.utils.private_download_url(
+                clean_pub_id,
+                fmt or "pdf",
+                resource_type="image",
+                type=upload_type
+            )
+            if dl_url:
+                candidates.append(dl_url)
+    except Exception:
+        pass
+
+    # 2. Signed CDN URL (handles authenticated/signed delivery requirements)
+    try:
+        signed_url, _ = cloudinary.utils.cloudinary_url(
+            pub_id,
+            resource_type=res_type,
+            type=upload_type,
+            format=fmt if (res_type == "image" and not pub_id.lower().endswith(".pdf")) else None,
+            version=version,
+            sign_url=True,
+            secure=True
+        )
+        if signed_url and signed_url not in candidates:
+            candidates.append(signed_url)
+    except Exception:
+        pass
+
+    # 3. Direct secure_url fallback
+    secure_url = item.get("url", "")
+    if secure_url:
+        if "%" not in secure_url:
+            secure_url = http_requests.utils.requote_uri(secure_url)
+        if secure_url not in candidates:
+            candidates.append(secure_url)
+
+    return candidates
 
 def download_papers_from_cloudinary(thread_id: str = "default"):
     """Downloads all raw and PDF files from Cloudinary user folder into local user uploads."""
@@ -306,71 +394,83 @@ def download_papers_from_cloudinary(thread_id: str = "default"):
     if not cloud_files:
         print(f"⚠️ No files found in Cloudinary folder '{user_cloud_folder}'.", flush=True)
         return []
-        
-    import base64
-    c_key = os.getenv("CLOUDINARY_API_KEY", "")
-    c_sec = os.getenv("CLOUDINARY_API_SECRET", "")
-    auth_headers = {}
-    if c_key and c_sec:
-        auth_str = base64.b64encode(f"{c_key}:{c_sec}".encode()).decode()
-        auth_headers["Authorization"] = f"Basic {auth_str}"
 
-    downloaded_files = []
+    # Group cloud entries by normalized filename so duplicate public_ids don't trigger 6 redundant downloads
+    grouped_by_filename = {}
     for item in cloud_files:
         filename = item["filename"]
         if not filename.lower().endswith(".pdf"):
             filename = f"{filename}.pdf"
+        grouped_by_filename.setdefault(filename, []).append(item)
+
+    downloaded_files = []
+    for filename, items in grouped_by_filename.items():
         local_path = os.path.join(user_upload_dir, filename)
-        secure_url = item.get("url", "")
         
         # If file already exists locally and is non-empty, keep it
         if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
             downloaded_files.append(local_path)
             continue
 
-        print(f"Downloading {filename} from Cloudinary ({item.get('bytes', 0)} bytes)...", flush=True)
-        try:
-            # 1. Generate authenticated signed URL from Cloudinary SDK
-            res_type = "image" if item.get("format") == "pdf" else "raw"
-            signed_url, _ = cloudinary.utils.cloudinary_url(
-                item["public_id"],
-                resource_type=res_type,
-                type="upload",
-                sign_url=True,
-                secure=True
-            )
-            
-            fetch_url = signed_url or secure_url
-            fetch_url = http_requests.utils.requote_uri(fetch_url)
-            
-            # Fetch with Cloudinary Basic Auth headers to bypass 401 restrictions
-            response = http_requests.get(fetch_url, headers=auth_headers, timeout=60)
-            
-            # Fallback to direct raw download URL if signed URL didn't return 200
-            if response.status_code != 200 and secure_url and secure_url != fetch_url:
-                retry_url = http_requests.utils.requote_uri(secure_url)
-                response = http_requests.get(retry_url, headers=auth_headers, timeout=60)
+        primary_item = items[0]
+        print(f"Downloading {filename} from Cloudinary ({primary_item.get('bytes', 0)} bytes)...", flush=True)
 
-            if response.status_code == 200:
-                with open(local_path, "wb") as f:
-                    f.write(response.content)
-                downloaded_files.append(local_path)
-                print(f"✅ Successfully downloaded {filename} ({len(response.content)} bytes)", flush=True)
-            else:
-                print(f"Failed to download {filename}: HTTP {response.status_code}", flush=True)
-        except Exception as err:
-            print(f"Error downloading {filename}: {err}", flush=True)
+        file_saved = False
+        last_status = None
+        for candidate_item in items:
+            if file_saved:
+                break
+            for fetch_url in _build_cloudinary_download_candidates(candidate_item):
+                try:
+                    response = http_requests.get(fetch_url, timeout=45)
+                    if response.status_code == 200 and response.content:
+                        with open(local_path, "wb") as f:
+                            f.write(response.content)
+                        downloaded_files.append(local_path)
+                        print(f"✅ Successfully downloaded {filename} ({len(response.content)} bytes)", flush=True)
+                        file_saved = True
+                        break
+                    else:
+                        last_status = response.status_code
+                except Exception as err:
+                    last_status = str(err)
+
+        if not file_saved:
+            print(
+                f"Failed to download {filename}: HTTP {last_status}. "
+                f"(Tip: Enable 'Allow delivery of PDF and ZIP files' in Cloudinary Settings -> Security, or re-upload the PDF.)",
+                flush=True
+            )
             
     return downloaded_files
 
-def build_local_vector_db(thread_id: str = "default"):
+def build_local_vector_db(thread_id: str = "default", force_sync: bool = False):
     """Reads all PDFs for this specific user, chunks text, and saves isolated FAISS index."""
     safe_thread = sanitize_thread_id(thread_id)
-    # First, pull any files from user's Cloudinary folder
-    download_papers_from_cloudinary(thread_id=safe_thread)
-    
     user_upload_dir = get_user_upload_dir(safe_thread)
     user_vector_path = get_user_vector_path(safe_thread)
+
+    # Check if we recently failed syncing for this thread_id to avoid 4x retry loops in a single turn
+    now = time.time()
+    last_failed = _FAILED_SYNC_TIMESTAMPS.get(safe_thread, 0)
+    if not force_sync and (now - last_failed) < SYNC_COOLDOWN_SECONDS:
+        existing_pdfs = [
+            os.path.join(user_upload_dir, f)
+            for f in os.listdir(user_upload_dir)
+            if f.lower().endswith(".pdf")
+        ] if os.path.exists(user_upload_dir) else []
+        if not existing_pdfs:
+            print(f"[RAG Engine] Skipping redundant cloud retry for '{safe_thread}' (cooldown active).", flush=True)
+            return {
+                "success": False,
+                "file_count": 0,
+                "files": [],
+                "chunks": 0,
+                "message": "No local PDF files available to index."
+            }
+
+    # Pull any files from user's Cloudinary folder
+    download_papers_from_cloudinary(thread_id=safe_thread)
     
     all_pdf_paths = []
     if os.path.exists(user_upload_dir):
@@ -379,6 +479,7 @@ def build_local_vector_db(thread_id: str = "default"):
                 all_pdf_paths.append(os.path.join(user_upload_dir, f))
 
     if not all_pdf_paths:
+        _FAILED_SYNC_TIMESTAMPS[safe_thread] = time.time()
         print(f"❌ Pipeline stopped: No PDF files available to index for user '{safe_thread}'.", flush=True)
         return {
             "success": False,
@@ -388,6 +489,7 @@ def build_local_vector_db(thread_id: str = "default"):
             "message": "No PDF files found to index. Upload a PDF first."
         }
 
+    _FAILED_SYNC_TIMESTAMPS.pop(safe_thread, None)
     all_chunks = []
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     processed_file_names = []
@@ -430,4 +532,4 @@ def build_local_vector_db(thread_id: str = "default"):
     }
 
 if __name__ == "__main__":
-    build_local_vector_db()
+    build_local_vector_db(force_sync=True)

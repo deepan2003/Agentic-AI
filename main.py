@@ -12,16 +12,9 @@ from gateway import verify_user_input, verify_agent_output
 
 load_dotenv()
 
-from typing import Annotated, Optional
-from typing_extensions import TypedDict
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import MemorySaver
-
-# 1. Define the Shared State with continuous message memory and user thread_id
-class AgentState(TypedDict, total=False):
+# 1. Define the Shared State with continuous message memory
+class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
-    thread_id: str
 
 AGENT_RULEBOOK_PATH = "./agent.md"
 
@@ -46,14 +39,73 @@ def invoke_orchestrator_llm(system_instruction: str, history_messages: list):
         override_model="openai/gpt-oss-20b"
     )
 
+def resolve_Requested_filename(user_message: str, default_stem: str = "research_report") -> str:
+    """
+    Extracts an explicit filename or infers the proper file extension (.docx for 'word document',
+    .md for 'markdown', .csv for 'csv', .txt otherwise) and builds a clean filename.
+    """
+    explicit_match = re.search(r'[\w\-]+\.(txt|md|docx?|csv|json|py)', user_message, re.IGNORECASE)
+    if explicit_match:
+        filename = explicit_match.group(0)
+        # Upgrade .doc to .docx so python-docx writes a valid Word document
+        if filename.lower().endswith(".doc"):
+            filename = filename[:-4] + ".docx"
+        return filename
+
+    msg_lower = user_message.lower()
+    if any(k in msg_lower for k in ["word document", "word file", "ms word", "microsoft word", "docx", "as word", "in word", ".doc"]):
+        ext = "docx"
+    elif any(k in msg_lower for k in ["markdown", ".md"]):
+        ext = "md"
+    elif "csv" in msg_lower:
+        ext = "csv"
+    elif "json" in msg_lower:
+        ext = "json"
+    else:
+        ext = "txt"
+
+    stop_words = {
+        "save", "the", "previous", "into", "file", "to", "a", "an", "as", "format",
+        "doc", "docx", "txt", "md", "word", "document", "also", "that", "this",
+        "in", "short", "brief", "please", "and", "write", "create", "export",
+        "what", "is", "are", "give", "me", "tell", "about", "current", "latest"
+    }
+    words = [w for w in re.findall(r'[a-zA-Z0-9]+', msg_lower) if w not in stop_words and len(w) > 1]
+    base_name = "_".join(words[:4]) if words else default_stem
+    return f"{base_name}.{ext}"
+
+def strip_save_instructions_for_research(user_message: str) -> str:
+    """
+    Removes file-saving phrasing (like 'also save that news as word document in short')
+    before passing the query to hybrid_research_worker when the user is NOT asking about
+    an uploaded PDF/resume. This prevents the word 'document' in 'word document' from
+    falsely triggering the Sub-Agent's 'Resume/Document query - Banning live web search' guard.
+    """
+    msg_lower = user_message.lower()
+    # If the user is genuinely asking about their uploaded PDF / resume / CV, keep as-is
+    if any(k in msg_lower for k in ["resume", "cv", "uploaded", "pdf", "deepan", "my document", "the document"]):
+        return user_message
+
+    cleaned = re.sub(
+        r'\b(and\s+also|also|and|then|please)?\s*(save|write|export|store|create)\s+(that|this|the|it|those|these)?\s*(news|result|results|answer|response|information|summary|report|data)?\s*(as|into|in|to)\s+(a\s+|an\s+)?(word\s+document|word\s+file|docx|doc|text\s+file|txt|markdown|md|file|document)(\s+in\s+short|\s+briefly)?\b',
+        '',
+        user_message,
+        flags=re.IGNORECASE
+    ).strip()
+
+    # Fallback cleanup if 'word document' still remains in a save request
+    if "word document" in cleaned.lower() and any(w in msg_lower for w in ["save", "write", "export"]):
+        cleaned = re.sub(r'\bword\s+document\b', 'file', cleaned, flags=re.IGNORECASE).strip()
+
+    return cleaned if len(cleaned) >= 3 else user_message
+
 # 3. Define the Core Manager Logic Node
 def main_orchestrator_node(state: AgentState, config: dict = None):
     # Get the latest message the user sent
     last_user_message = state["messages"][-1].content
-    thread_id = state.get("thread_id")
-    if not thread_id and config and "configurable" in config:
-        thread_id = config["configurable"].get("thread_id")
-    thread_id = thread_id or "default"
+    thread_id = "default"
+    if config and "configurable" in config:
+        thread_id = config["configurable"].get("thread_id", "default")
     
     # Load global rules
     rules = ""
@@ -148,16 +200,7 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
         if len(state["messages"]) > 1:
             previous_agent_text = state["messages"][-2].content
             
-        # Determine target filename from prompt
-        filename_match = re.search(r'[\w\-]+\.(txt|md|docx?|csv|json|py|doc)', last_user_message, re.IGNORECASE)
-        if filename_match:
-            filename = filename_match.group(0)
-        else:
-            words = [w for w in re.findall(r'[a-zA-Z0-9]+', last_user_message.lower()) if w not in ["save", "the", "previous", "into", "file", "to", "a", "as", "format", "doc", "docx", "txt"]]
-            base_name = "_".join(words[:4]) if words else "saved_document"
-            ext_match = re.search(r'\b(txt|md|docx?|csv|json|doc)\b', last_user_message.lower())
-            ext = ext_match.group(1) if ext_match else "txt"
-            filename = f"{base_name}.{ext}"
+        filename = resolve_Requested_filename(last_user_message, default_stem="saved_document")
 
         # Clean content so that raw code blocks/Python boilerplate are not saved into text/word documents
         clean_text = clean_document_content(previous_agent_text)
@@ -180,27 +223,23 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
     else:
         print("[Main Agent] Intent identified: Fact/Tool Dependent. Activating Research Sub-Agent...")
         
-        # Delegate factual exploration to your sub-agent with user's isolated context
-        fact_sheet = hybrid_research_worker(last_user_message, thread_id=thread_id)
+        # Strip file-saving phrasing (e.g. 'also save that news as word document') before calling sub-agent
+        # so the word 'document' does not falsely trigger the Sub-Agent's 'Resume/Document query -> Ban live web search' rule
+        research_query = strip_save_instructions_for_research(last_user_message)
+        fact_sheet = hybrid_research_worker(research_query, thread_id=thread_id)
         
-        # If user asked to save research findings to a file, ensure it is written to disk!
-        if any(w in last_user_message.lower() for w in ["save", "create a file", "write to file", ".txt", ".md", ".doc", ".docx"]):
-            filename_match = re.search(r'[\w\-]+\.(txt|md|docx?|csv|json|py|doc)', last_user_message, re.IGNORECASE)
-            if filename_match:
-                target_filename = filename_match.group(0)
-            else:
-                words = [w for w in re.findall(r'[a-zA-Z0-9]+', last_user_message.lower()) if w not in ["save", "the", "into", "file", "to", "a", "as", "format", "news", "give", "me", "what", "is"]]
-                base_name = "_".join(words[:4]) if words else "research_report"
-                target_filename = f"{base_name}.txt"
-            
-            target_path = os.path.join("./projects", os.path.basename(target_filename))
-            if not os.path.exists(target_path):
-                file_content = f"Research Summary:\n{fact_sheet.summary}\n\nKey Verified Facts:\n" + "\n".join(f"- {f}" for f in fact_sheet.verified_facts)
-                save_file_to_disk.invoke({"filename": target_filename, "content": file_content})
-                print(f"[Main Agent] Physical file saved to disk: {target_filename}")
+        # If user asked to save research findings to a file, ensure it is written to disk with the proper extension (.docx for Word)!
+        saved_filename_note = ""
+        if any(w in last_user_message.lower() for w in ["save", "create a file", "write to file", "word document", "word file", ".txt", ".md", ".doc", ".docx"]):
+            target_filename = resolve_Requested_filename(last_user_message, default_stem="research_report")
+            file_content = f"Research Summary:\n{fact_sheet.summary}\n\nKey Verified Facts:\n" + "\n".join(f"- {f}" for f in fact_sheet.verified_facts)
+            save_file_to_disk.invoke({"filename": target_filename, "content": file_content})
+            print(f"[Main Agent] Physical file saved to disk: {target_filename}")
+            saved_filename_note = f"File Saved to Disk: {target_filename}\n"
 
         # Standardize context format returned by researcher
         research_context = (
+            f"{saved_filename_note}"
             f"Research Summary: {fact_sheet.summary}\n"
             f"Extracted Facts: {', '.join(fact_sheet.verified_facts)}\n"
             f"Source Links/Papers: {', '.join(fact_sheet.sources_used)}\n"
@@ -211,10 +250,10 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
             f"CONTEXT FACTS PROVIDED BY SUB-AGENT:\n{research_context}\n\n"
             f"CRITICAL RULES:\n"
             f"1. Base your answer strictly on the provided context facts. Do NOT hallucinate or mix unrelated facts.\n"
-            f"2. You are talking directly to the user. Write out the final answer in plain text. DO NOT call tools or output function call JSON.\n"
+            f"2. Do NOT call any tools or output JSON function calls; the sub-agent has already run.\n"
             f"3. Never use raw HTML tags such as <br>, <br/>, or <div>. Use Markdown bullet points (- ) and paragraphs instead.\n"
             f"4. Directly address the user's specific inquiry. If the facts do not answer the question, state clearly that the information is unavailable in the retrieved sources.\n"
-            f"5. If the user asked to save or create a file, confirm the filename saved and remind them they can download it directly from the 'Saved Documents' sidebar."
+            f"5. If a file was saved to disk, confirm the exact filename saved and remind the user they can download it from the 'Saved Documents' sidebar."
         )
         
         raw_response = invoke_orchestrator_llm(system_instruction, state["messages"])
