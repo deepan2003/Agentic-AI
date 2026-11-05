@@ -4,7 +4,7 @@ import contextlib
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from ingestion import build_local_vector_db, list_cloud_storage_files, index_uploaded_pdf, list_uploaded_pdfs
+from ingestion import build_local_vector_db, list_cloud_storage_files, index_uploaded_pdf, list_uploaded_pdfs, delete_cloudinary_file, delete_uploaded_pdf
 
 load_dotenv()
 
@@ -40,6 +40,26 @@ def upload_pdf_endpoint():
     result = index_uploaded_pdf(file_bytes, filename)
     status_code = 200 if result.get("success") else 500
     return jsonify(result), status_code
+
+@app.route("/api/delete_cloud_file", methods=["POST"])
+def delete_cloud_file_endpoint():
+    """Deletes a file from Cloudinary and cleans local copies."""
+    data = request.json or {}
+    public_id = data.get("public_id")
+    filename = data.get("filename", "")
+    resource_type = data.get("resource_type", "raw")
+    
+    if not public_id and not filename:
+        return jsonify({"success": False, "message": "Missing public_id or filename"}), 400
+        
+    print(f"\n====== 🗑️ DELETE REQUEST: {public_id or filename} ======", flush=True)
+    res = {}
+    if public_id:
+        res = delete_cloudinary_file(public_id, resource_type=resource_type)
+    if filename:
+        delete_uploaded_pdf(filename)
+        
+    return jsonify({"success": True, "result": res}), 200
 
 @app.route("/api/storage_status", methods=["GET"])
 def storage_status_endpoint():
@@ -141,6 +161,10 @@ def chat_endpoint():
         printed_logs = [line.strip() for line in captured_stdout.getvalue().splitlines() if line.strip()]
         combined_logs = printed_logs + smart_gateway.execution_logs
 
+        # Also print to Render server console so logs are permanently visible in Render dashboard!
+        for plog in combined_logs:
+            print(f"[Render Live Log] {plog}", flush=True)
+
         print("✅ 4. Success! Sending answer back to frontend.", flush=True)
         return jsonify({
             "response": final_response, 
@@ -148,10 +172,11 @@ def chat_endpoint():
         })
 
     except Exception as e:
-        print(f"❌ CRITICAL SERVER ERROR: {str(e)}", flush=True)
+        err_msg = str(e)
+        print(f"❌ CRITICAL SERVER ERROR: {err_msg}", flush=True)
         return jsonify({
-            "response": f"An execution error occurred inside the agent engine: {str(e)}",
-            "logs": smart_gateway.execution_logs + [f"[CRITICAL] {str(e)}"]
+            "response": f"An execution error occurred inside the agent engine: {err_msg}",
+            "logs": smart_gateway.execution_logs + [f"[CRITICAL] {err_msg}"]
         }), 500
 
 if __name__ == "__main__":

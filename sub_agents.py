@@ -170,28 +170,28 @@ def hybrid_research_worker(query: str) -> FactSheet:
     # ====================================================================
     # 5. ACTIVE TOOL EXECUTION LOOP (Coding + File System)
     # ====================================================================
-    print("[Sub-Agent] Checking if tool execution is required...", flush=True)
-    tool_agent = create_react_agent(llm, tools=[execute_python_code, save_file_to_disk])
-    
-    tool_instructions = (
-        f"You are a core research extractor and tool router.\n\n"
-        f"TASK 1: FACT EXTRACTION (ALWAYS DO THIS)\n"
-        f"- Extract ALL relevant factual news points (up to 10 points) from the context so nothing gets missed.\n\n"
-        f"TASK 2: TOOL ROUTING\n"
-        f"- If the user asks for math/coding, use 'execute_python_code'.\n"
-        f"- If the user asks to save/create a file, use 'save_file_to_disk'.\n"
-        f"- CRITICAL JSON RULE: When using 'save_file_to_disk', you MUST pass the content to the tool as ONE single, continuous paragraph. DO NOT use newlines (\\n), asterisks, bullet points, or unescaped quotes in the tool argument! It will crash the API.\n"
-        f"- If the user just asks a question, do NOT use any tools. Just return your extracted facts.\n\n"
-        f"RESEARCH CONTEXT:\n{combined_context}\n\n"
-        f"User Query: {query}"
-    )
+    needs_tools = any(kw in query.lower() for kw in ["code", "python", "calculate", "math", "save", "write to", "create a file", "export"])
+    if needs_tools:
+        print("[Sub-Agent] Active tool required. Invoking tool execution agent...", flush=True)
+        tool_agent = create_react_agent(llm, tools=[execute_python_code, save_file_to_disk])
+        
+        tool_instructions = (
+            f"You are a tool execution agent.\n"
+            f"- If the user asks for math/coding, use 'execute_python_code'.\n"
+            f"- If the user asks to save/create a file, use 'save_file_to_disk'.\n"
+            f"- CRITICAL JSON RULE: When using 'save_file_to_disk', you MUST pass the content to the tool as ONE single, continuous paragraph without unescaped newlines or quotes.\n\n"
+            f"RESEARCH CONTEXT:\n{combined_context}\n\n"
+            f"User Query: {query}"
+        )
 
-    tool_results = tool_agent.invoke(
-        {"messages": [("user", tool_instructions)]},
-        config={"recursion_limit": 10}
-    )
-    final_tool_answer = tool_results["messages"][-1].content
-    combined_context += f"--- ACTIVE TOOL RESULTS ---\n{final_tool_answer}\n\n"
+        tool_results = tool_agent.invoke(
+            {"messages": [("user", tool_instructions)]},
+            config={"recursion_limit": 5}
+        )
+        final_tool_answer = tool_results["messages"][-1].content
+        combined_context += f"--- ACTIVE TOOL RESULTS ---\n{final_tool_answer}\n\n"
+    else:
+        print("[Sub-Agent] Standard informational query. Skipping redundant tool agent to optimize latency and memory.", flush=True)
     # ====================================================================
 
     # 6. Final Output Structuring Block (Robust JSON Generation without fragile tool-calling)

@@ -30,10 +30,12 @@ else
     echo "⚠️ Flask backend took longer than 60s to report healthy, continuing..."
 fi
 
-# Start Streamlit frontend on Render's public $PORT
+# Start Streamlit frontend on Render's public $PORT with WebSocket timeouts optimized for free tier
 echo "🚀 Starting Streamlit Frontend on public port $PORT..."
 exec streamlit run frontend.py \
     --server.port "$PORT" \
     --server.address 0.0.0.0 \
     --server.headless true \
+    --server.enableCORS false \
+    --server.enableXsrfProtection false \
     --browser.gatherUsageStats false

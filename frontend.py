@@ -16,6 +16,7 @@ FLASK_API_URL = f"{BACKEND_URL}/api/chat"
 UPDATE_API_URL = f"{BACKEND_URL}/api/update_knowledge"
 STORAGE_STATUS_URL = f"{BACKEND_URL}/api/storage_status"
 UPLOAD_PDF_URL = f"{BACKEND_URL}/api/upload_pdf"
+DELETE_CLOUD_FILE_URL = f"{BACKEND_URL}/api/delete_cloud_file"
 
 # --- USER IDENTIFICATION SYSTEM (LOCKED STATE) ---
 st.sidebar.title("👤 User Profile")
@@ -162,12 +163,27 @@ try:
 
         st.sidebar.markdown(f"**Vector Store Status:** {'🟢 Active & Loaded' if index_ready else '🔴 Empty / Waiting for PDF'}")
 
-        # Cloud storage view expander
+        # Cloud storage view expander with delete capability
         with st.sidebar.expander("☁️ Cloud Storage (Cloudinary)", expanded=False):
             if cloud_files:
                 st.write(f"**{len(cloud_files)} file(s) in Cloudinary:**")
                 for cf in cloud_files:
-                    st.write(f"- `{cf['filename']}` ({cf.get('bytes', 0)/1024:.1f} KB)")
+                    c1, c2 = st.columns([3, 1])
+                    c1.write(f"📄 `{cf['filename']}` ({cf.get('bytes', 0)/1024:.1f} KB)")
+                    res_type = "image" if cf.get("format") == "pdf" else "raw"
+                    if c2.button("🗑️", key=f"del_c_{cf['public_id']}", help=f"Delete {cf['filename']} from Cloudinary"):
+                        try:
+                            del_res = requests.post(
+                                DELETE_CLOUD_FILE_URL, 
+                                json={"public_id": cf["public_id"], "filename": cf["filename"], "resource_type": res_type},
+                                timeout=15
+                            )
+                            if del_res.status_code == 200:
+                                st.success(f"Deleted {cf['filename']}!")
+                                time.sleep(1)
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
             else:
                 st.caption("No files currently detected in Cloudinary folder `agentic-rag-data`.")
 except Exception:

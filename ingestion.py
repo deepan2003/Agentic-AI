@@ -12,7 +12,14 @@ from langchain_community.document_loaders import PyPDFLoader
 # 1. Load environment variables
 load_dotenv()
 
-# Configure Cloudinary with environment variables
+def get_embedding_model():
+    """Lazy load embedding model to preserve Render RAM."""
+    global _ingest_embeddings
+    if "_ingest_embeddings" not in globals() or _ingest_embeddings is None:
+        _ingest_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return _ingest_embeddings
+
+_ingest_embeddings = None
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
@@ -62,7 +69,7 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
         if not docs:
             return {"success": False, "message": "No readable text found in PDF", "chunks": 0}
 
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        embeddings = get_embedding_model()
         index_file = os.path.join(VECTOR_DB_PATH, "index.faiss")
         
         if os.path.exists(index_file):
@@ -91,6 +98,30 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
             "chunks": 0,
             "message": f"Failed to extract text from PDF: {str(err)}"
         }
+
+def delete_cloudinary_file(public_id: str, resource_type: str = "raw") -> dict:
+    """Deletes a file from Cloudinary given its public_id."""
+    try:
+        res = cloudinary.uploader.destroy(public_id, resource_type=resource_type)
+        print(f"[Cloudinary] Delete result for '{public_id}' ({resource_type}): {res}", flush=True)
+        return {"success": True, "result": res}
+    except Exception as e:
+        print(f"[Cloudinary Error] Failed to delete {public_id}: {e}", flush=True)
+        return {"success": False, "error": str(e)}
+
+def delete_uploaded_pdf(filename: str) -> dict:
+    """Deletes a PDF from local data_uploads and tmp_downloads."""
+    safe_name = os.path.basename(filename)
+    deleted_any = False
+    for d in [UPLOAD_DIR, TMP_DIR]:
+        path = os.path.join(d, safe_name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                deleted_any = True
+            except Exception as e:
+                print(f"Error removing {path}: {e}")
+    return {"success": deleted_any}
 
 def list_uploaded_pdfs() -> list:
     """Lists all PDFs currently saved and indexed in the knowledge base."""
@@ -176,16 +207,26 @@ def download_papers_from_cloudinary():
     downloaded_files = []
     for item in cloud_files:
         filename = item["filename"]
+        if not filename.lower().endswith(".pdf"):
+            filename = f"{filename}.pdf"
         local_path = os.path.join(TMP_DIR, filename)
         secure_url = item["url"]
         
         print(f"Downloading {filename} from Cloudinary ({item.get('bytes', 0)} bytes)...", flush=True)
         try:
-            response = http_requests.get(secure_url, timeout=60)
+            # If secure_url is empty, fetch using cloudinary image/raw URL format
+            fetch_url = secure_url
+            if not fetch_url:
+                cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+                res_type = "image" if item.get("format") == "pdf" else "raw"
+                fetch_url = f"https://res.cloudinary.com/{cloud_name}/{res_type}/upload/{item['public_id']}"
+                
+            response = http_requests.get(fetch_url, timeout=60)
             if response.status_code == 200:
                 with open(local_path, "wb") as f:
                     f.write(response.content)
                 downloaded_files.append(local_path)
+                print(f"✅ Successfully downloaded {filename} ({len(response.content)} bytes)", flush=True)
             else:
                 print(f"Failed to download {filename}: HTTP {response.status_code}", flush=True)
         except Exception as err:
@@ -247,7 +288,7 @@ def build_local_vector_db():
         }
 
     print(f"Generating embeddings for {len(all_chunks)} chunks using Hugging Face (all-MiniLM-L6-v2)...", flush=True)
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    embeddings = get_embedding_model()
     
     os.makedirs(VECTOR_DB_PATH, exist_ok=True)
     vector_db = FAISS.from_documents(all_chunks, embeddings)
