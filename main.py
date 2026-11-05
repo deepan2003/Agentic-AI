@@ -158,8 +158,14 @@ def main_orchestrator_node(state: AgentState):
             f"4. If the user asked to save or create a file, confirm the filename saved and remind them they can download it directly from the 'Saved Documents' sidebar."
         )
         
-        response = invoke_orchestrator_llm(system_instruction, state["messages"])
-        return {"messages": [response]}
+        raw_response = invoke_orchestrator_llm(system_instruction, state["messages"])
+        
+        # Rigorous post-generation hallucination verification
+        if fact_sheet.verified_facts:
+            verified_content = verify_agent_output(raw_response.content, fact_sheet.verified_facts)
+            raw_response.content = verified_content
+            
+        return {"messages": [raw_response]}
 
 # 4. Build and Compile the LangGraph Workflow
 workflow = StateGraph(AgentState)
