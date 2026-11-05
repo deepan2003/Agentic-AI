@@ -56,9 +56,9 @@ os.makedirs(VECTOR_DB_PATH, exist_ok=True)
 
 def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
     """
-    Saves an uploaded PDF to data_uploads, extracts chunks,
-    and updates the active local FAISS vector index immediately.
-    Also backs up the file to Cloudinary if available.
+    1. Saves uploaded PDF to data_uploads.
+    2. Backs up directly to Cloudinary so it shows in Cloud Storage.
+    3. Extracts chunks and updates FAISS vector index immediately.
     """
     safe_name = os.path.basename(filename)
     dest_path = os.path.join(UPLOAD_DIR, safe_name)
@@ -67,7 +67,20 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
         
     print(f"[Knowledge Engine] Indexing newly uploaded PDF: {safe_name}...", flush=True)
 
-    # Process and build/update FAISS index immediately
+    # 1. First: Always back up to Cloudinary
+    try:
+        cloudinary.uploader.upload(
+            dest_path,
+            folder=CLOUDINARY_FOLDER,
+            resource_type="raw",
+            public_id=safe_name,
+            timeout=15
+        )
+        print(f"[Knowledge Engine] Successfully uploaded {safe_name} to Cloudinary folder '{CLOUDINARY_FOLDER}'.", flush=True)
+    except Exception as e:
+        print(f"[Knowledge Engine Warning] Cloudinary upload notice: {e}", flush=True)
+
+    # 2. Second: Process text chunks and build FAISS vector index
     try:
         loader = PyPDFLoader(dest_path)
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -90,19 +103,6 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
         else:
             vector_db = FAISS.from_documents(docs, embeddings)
             vector_db.save_local(VECTOR_DB_PATH)
-
-        # Non-blocking background backup to Cloudinary (will not delay indexing or timeout)
-        try:
-            cloudinary.uploader.upload(
-                dest_path,
-                folder=CLOUDINARY_FOLDER,
-                resource_type="raw",
-                public_id=safe_name,
-                timeout=10
-            )
-            print(f"[Knowledge Engine] Backed up {safe_name} to Cloudinary folder '{CLOUDINARY_FOLDER}'.", flush=True)
-        except Exception as e:
-            print(f"[Knowledge Engine Info] Cloudinary backup skipped or slow: {e}")
 
         return {
             "success": True,

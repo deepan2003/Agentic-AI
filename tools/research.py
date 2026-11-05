@@ -8,24 +8,18 @@ _embeddings = None
 
 def get_embeddings():
     """
-    Returns lightweight embeddings:
-    Uses Gemini embeddings (0 MB RAM) to avoid Render 512MB limit.
+    Returns FastEmbed CPU ONNX quantized model (~30MB RAM, zero PyTorch, 100% reliable).
     """
     global _embeddings
     if _embeddings is None:
-        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if gemini_key:
-            try:
-                from langchain_google_genai import GoogleGenerativeAIEmbeddings
-                print("[System] Using Google Gemini Cloud Embeddings for research lookup (0MB RAM)...", flush=True)
-                _embeddings = GoogleGenerativeAIEmbeddings(
-                    model="models/embedding-001",
-                    google_api_key=gemini_key
-                )
-                return _embeddings
-            except Exception as e:
-                print(f"[System Warning] Gemini embeddings initialization error: {e}")
-                
+        try:
+            from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+            print("[System] Using FastEmbed CPU ONNX quantized embeddings (~30MB RAM)...", flush=True)
+            _embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+            return _embeddings
+        except Exception as e:
+            print(f"[System Warning] FastEmbed fallback: {e}")
+            
         print("[System] Loading HuggingFace embedding weights into RAM...", flush=True)
         _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return _embeddings
