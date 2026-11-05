@@ -8,15 +8,29 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_openai import OpenAIEmbeddings
 
 # 1. Load environment variables
 load_dotenv()
 
 def get_embedding_model():
-    """Lazy load embedding model to preserve Render RAM."""
+    """
+    Returns lightweight API embeddings (OpenAI text-embedding-3-small) if key is present,
+    using ZERO local RAM and returning in ~0.2 seconds.
+    Falls back to HuggingFace only if no API key is available.
+    """
     global _ingest_embeddings
     if "_ingest_embeddings" not in globals() or _ingest_embeddings is None:
-        _ingest_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if openai_key and openai_key.startswith("sk-"):
+            print("[Knowledge Engine] Using ultra-fast cloud embeddings (OpenAI 0MB RAM)...", flush=True)
+            _ingest_embeddings = OpenAIEmbeddings(
+                model="text-embedding-3-small",
+                api_key=openai_key
+            )
+        else:
+            print("[Knowledge Engine] Using local HuggingFace embeddings...", flush=True)
+            _ingest_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return _ingest_embeddings
 
 _ingest_embeddings = None
