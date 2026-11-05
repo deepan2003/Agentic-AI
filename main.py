@@ -54,11 +54,12 @@ def main_orchestrator_node(state: AgentState):
     
     # --- INTENT CLASSIFIER / ROUTER ---
     router_prompt = (
-        "Classify the user's prompt into one of three categories: 'CHITCHAT', 'SAVE_HISTORY', or 'RESEARCH'.\n"
+        "Classify the user's prompt into one of four categories: 'CHITCHAT', 'CHAT_HISTORY', 'SAVE_HISTORY', or 'RESEARCH'.\n"
         "- Use 'CHITCHAT' for greetings, casual conversation, jokes, expressions of emotion, or simple pleasantries.\n"
+        "- Use 'CHAT_HISTORY' if the user asks what we discussed, asks to summarize our previous conversation, asks what their previous question was, or references past interactions between you and them.\n"
         "- Use 'SAVE_HISTORY' ONLY if the user explicitly asks to save, export, or write the PREVIOUS conversation text, previous response, or chat history into a file/document.\n"
-        "- Use 'RESEARCH' if the user asks for new news, technical documentation, coding, calculations, general questions, or hard factual data.\n\n"
-        "Return ONLY the word 'CHITCHAT', 'SAVE_HISTORY', or 'RESEARCH' and absolutely nothing else.\n\n"
+        "- Use 'RESEARCH' if the user asks for new news, facts, uploaded PDF context, technical documentation, coding, calculations, or general questions.\n\n"
+        "Return ONLY the word 'CHITCHAT', 'CHAT_HISTORY', 'SAVE_HISTORY', or 'RESEARCH' and absolutely nothing else.\n\n"
         f"User Prompt: {last_user_message}"
     )
     
@@ -76,6 +77,42 @@ def main_orchestrator_node(state: AgentState):
             f"{rules}\n\n"
             "You are a helpful AI assistant. Respond to the user's greeting or statement naturally, "
             "warmly, and conversationally. Do not include fact sheets or source links."
+        )
+        
+        response = invoke_orchestrator_llm(system_instruction, state["messages"])
+        return {"messages": [response]}
+
+    # Route A2: Conversation Memory & Chat History Path
+    elif "CHAT_HISTORY" in intent:
+        print("[Main Agent] Intent identified: Chat History / Memory Summary. Reading directly from conversation state...")
+        
+        # Build a clean log of all previous turns in this session
+        history_transcript = []
+        # Exclude the current inquiry from the past conversation log
+        past_turns = state["messages"][:-1]
+        
+        for m in past_turns:
+            role = getattr(m, "type", None) or getattr(m, "role", "user")
+            speaker = "User" if role in ["human", "user"] else "Assistant"
+            content = getattr(m, "content", "")
+            if content:
+                history_transcript.append(f"{speaker}: {content}")
+
+        if not history_transcript:
+            return {"messages": [invoke_orchestrator_llm(
+                "Inform the user politely that this is the beginning of the chat session, so there are no earlier conversation topics logged yet.",
+                state["messages"]
+            )]}
+
+        past_context = "\n\n".join(history_transcript)
+        system_instruction = (
+            f"{rules}\n\n"
+            f"ACTUAL CONVERSATION LOG BETWEEN USER AND ASSISTANT:\n"
+            f"{past_context}\n\n"
+            f"CRITICAL INSTRUCTIONS:\n"
+            f"1. Summarize ONLY the actual questions and answers discussed above between you and the user.\n"
+            f"2. DO NOT perform web searches, and do NOT talk about third-party books or external articles.\n"
+            f"3. Present the summary clearly using clean Markdown bullet points (- ) and concise points."
         )
         
         response = invoke_orchestrator_llm(system_instruction, state["messages"])
