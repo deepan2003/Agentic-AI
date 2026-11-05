@@ -8,21 +8,26 @@ _embeddings = None
 
 def get_embeddings():
     """
-    Returns lightweight API embeddings if OpenAI key is present (0 MB RAM),
-    preventing Render 512MB OOM crashes during retrieval.
+    Returns lightweight embeddings:
+    Uses Gemini embeddings (0 MB RAM) to avoid Render 512MB limit.
     """
     global _embeddings
     if _embeddings is None:
-        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if openai_key and openai_key.startswith("sk-"):
-            print("[System] Using ultra-fast cloud embeddings for research lookup (0MB RAM)...", flush=True)
-            _embeddings = OpenAIEmbeddings(
-                model="text-embedding-3-small",
-                api_key=openai_key
-            )
-        else:
-            print("[System] Loading HuggingFace embedding weights into RAM...", flush=True)
-            _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if gemini_key:
+            try:
+                from langchain_google_genai import GoogleGenerativeAIEmbeddings
+                print("[System] Using Google Gemini Cloud Embeddings for research lookup (0MB RAM)...", flush=True)
+                _embeddings = GoogleGenerativeAIEmbeddings(
+                    model="models/text-embedding-004",
+                    google_api_key=gemini_key
+                )
+                return _embeddings
+            except Exception as e:
+                print(f"[System Warning] Gemini embeddings initialization error: {e}")
+                
+        print("[System] Loading HuggingFace embedding weights into RAM...", flush=True)
+        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return _embeddings
 
 def query_local_research_papers(query_str: str, top_k: int = 3) -> list:

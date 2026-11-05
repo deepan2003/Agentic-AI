@@ -15,22 +15,27 @@ load_dotenv()
 
 def get_embedding_model():
     """
-    Returns lightweight API embeddings (OpenAI text-embedding-3-small) if key is present,
-    using ZERO local RAM and returning in ~0.2 seconds.
-    Falls back to HuggingFace only if no API key is available.
+    Returns lightweight embeddings:
+    1. Gemini embeddings (free tier, 0 MB RAM) if GEMINI_API_KEY is available.
+    2. HuggingFace as fallback.
     """
     global _ingest_embeddings
     if "_ingest_embeddings" not in globals() or _ingest_embeddings is None:
-        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if openai_key and openai_key.startswith("sk-"):
-            print("[Knowledge Engine] Using ultra-fast cloud embeddings (OpenAI 0MB RAM)...", flush=True)
-            _ingest_embeddings = OpenAIEmbeddings(
-                model="text-embedding-3-small",
-                api_key=openai_key
-            )
-        else:
-            print("[Knowledge Engine] Using local HuggingFace embeddings...", flush=True)
-            _ingest_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if gemini_key:
+            try:
+                from langchain_google_genai import GoogleGenerativeAIEmbeddings
+                print("[Knowledge Engine] Using Google Gemini Cloud Embeddings (0MB RAM)...", flush=True)
+                _ingest_embeddings = GoogleGenerativeAIEmbeddings(
+                    model="models/text-embedding-004",
+                    google_api_key=gemini_key
+                )
+                return _ingest_embeddings
+            except Exception as e:
+                print(f"[Knowledge Engine Warning] Gemini embeddings initialization error: {e}")
+                
+        print("[Knowledge Engine] Using local HuggingFace embeddings...", flush=True)
+        _ingest_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return _ingest_embeddings
 
 _ingest_embeddings = None
