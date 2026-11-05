@@ -16,7 +16,7 @@ load_dotenv()
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
-AGENT_RULEBOOK_PATH = "./projects/agent.md"
+AGENT_RULEBOOK_PATH = "./agent.md"
 
 def invoke_orchestrator_llm(system_instruction: str, history_messages: list):
     """
@@ -151,8 +151,11 @@ def main_orchestrator_node(state: AgentState):
         system_instruction = (
             f"{rules}\n\n"
             f"CONTEXT FACTS PROVIDED BY SUB-AGENT:\n{research_context}\n\n"
-            f"CRITICAL: Base your answer strictly on the provided context facts. "
-            f"NOTE: If the user asked to save or create a file, confirm the filename saved and remind them they can download it directly from the 'Saved Documents' sidebar."
+            f"CRITICAL RULES:\n"
+            f"1. Base your answer strictly on the provided context facts. Do NOT hallucinate or mix unrelated facts.\n"
+            f"2. Never use raw HTML tags such as <br>, <br/>, or <div>. Use Markdown bullet points (- ) and paragraphs instead.\n"
+            f"3. Directly address the user's specific inquiry. If the facts do not answer the question, state clearly that the information is unavailable in the retrieved sources.\n"
+            f"4. If the user asked to save or create a file, confirm the filename saved and remind them they can download it directly from the 'Saved Documents' sidebar."
         )
         
         response = invoke_orchestrator_llm(system_instruction, state["messages"])

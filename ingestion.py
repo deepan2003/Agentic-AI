@@ -48,19 +48,7 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
         
     print(f"[Knowledge Engine] Indexing newly uploaded PDF: {safe_name}...", flush=True)
 
-    # Optional background backup to Cloudinary
-    try:
-        cloudinary.uploader.upload(
-            dest_path,
-            folder=CLOUDINARY_FOLDER,
-            resource_type="raw",
-            public_id=safe_name
-        )
-        print(f"[Knowledge Engine] Backed up {safe_name} to Cloudinary folder '{CLOUDINARY_FOLDER}'.", flush=True)
-    except Exception as e:
-        print(f"[Knowledge Engine Info] Cloudinary cloud backup: {e}")
-
-    # Process and build/update FAISS index
+    # Process and build/update FAISS index immediately
     try:
         loader = PyPDFLoader(dest_path)
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -83,6 +71,19 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
         else:
             vector_db = FAISS.from_documents(docs, embeddings)
             vector_db.save_local(VECTOR_DB_PATH)
+
+        # Non-blocking background backup to Cloudinary (will not delay indexing or timeout)
+        try:
+            cloudinary.uploader.upload(
+                dest_path,
+                folder=CLOUDINARY_FOLDER,
+                resource_type="raw",
+                public_id=safe_name,
+                timeout=10
+            )
+            print(f"[Knowledge Engine] Backed up {safe_name} to Cloudinary folder '{CLOUDINARY_FOLDER}'.", flush=True)
+        except Exception as e:
+            print(f"[Knowledge Engine Info] Cloudinary backup skipped or slow: {e}")
 
         return {
             "success": True,
