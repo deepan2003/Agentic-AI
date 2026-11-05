@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from ingestion import (
+    sanitize_thread_id,
     build_local_vector_db,
     list_cloud_storage_files,
     index_uploaded_pdf,
@@ -29,16 +30,17 @@ def append_live_log(thread_id: str, line: str):
     clean = line.strip()
     if not clean:
         return
+    safe_thread = sanitize_thread_id(thread_id)
     ts = datetime.now().strftime("%H:%M:%S")
     entry = f"[{ts}] {clean}"
     with LIVE_LOGS_LOCK:
-        LIVE_LOGS.setdefault(thread_id, []).append(entry)
+        LIVE_LOGS.setdefault(safe_thread, []).append(entry)
 
 # Dual stdout writer that outputs to Render console immediately AND streams to LIVE_LOGS for frontend polling
 class DualStream(io.StringIO):
     def __init__(self, thread_id: str = "default"):
         super().__init__()
-        self.thread_id = thread_id
+        self.thread_id = sanitize_thread_id(thread_id)
         self._buf = ""
 
     def write(self, s):
@@ -75,14 +77,14 @@ def health_check():
 @app.route("/api/live_logs", methods=["GET"])
 def live_logs_endpoint():
     """Returns real-time backend execution logs for the currently running request."""
-    thread_id = (request.args.get("thread_id") or "default").strip() or "default"
+    thread_id = sanitize_thread_id(request.args.get("thread_id") or "default")
     with LIVE_LOGS_LOCK:
         logs = list(LIVE_LOGS.get(thread_id, []))
     return jsonify({"success": True, "thread_id": thread_id, "logs": logs}), 200
 
 @app.route("/api/upload_pdf", methods=["POST"])
 def upload_pdf_endpoint():
-    """Receives an uploaded PDF file, indexes it into user FAISS index, and backs it up."""
+    """Receives an uploaded PDF file, indexes it into this user's private FAISS index, and backs it up."""
     if "file" not in request.files:
         return jsonify({"success": False, "message": "No file uploaded in request."}), 400
         
@@ -94,7 +96,7 @@ def upload_pdf_endpoint():
     if not filename.lower().endswith(".pdf"):
         return jsonify({"success": False, "message": "Only PDF files are supported."}), 400
 
-    thread_id = request.form.get("thread_id", "default").strip() or "default"
+    thread_id = sanitize_thread_id(request.form.get("thread_id", "default"))
     file_bytes = uploaded_file.read()
     print(f"\n====== 📄 PDF UPLOAD RECEIVED: {filename} ({len(file_bytes)} bytes) FOR USER '{thread_id}' ======", flush=True)
 
@@ -104,12 +106,12 @@ def upload_pdf_endpoint():
 
 @app.route("/api/delete_cloud_file", methods=["POST"])
 def delete_cloud_file_endpoint():
-    """Deletes a file from Cloudinary and cleans local copies."""
+    """Deletes a file from this user's Cloudinary folder and cleans their local copy & vector index."""
     data = request.json or {}
     public_id = data.get("public_id")
     filename = data.get("filename", "")
     resource_type = data.get("resource_type", "raw")
-    thread_id = data.get("thread_id", "default")
+    thread_id = sanitize_thread_id(data.get("thread_id", "default"))
     
     if not public_id and not filename:
         return jsonify({"success": False, "message": "Missing public_id or filename"}), 400
@@ -117,7 +119,7 @@ def delete_cloud_file_endpoint():
     print(f"\n====== 🗑️ DELETE REQUEST: {public_id or filename} FOR USER '{thread_id}' ======", flush=True)
     res = {}
     if public_id:
-        res = delete_cloudinary_file(public_id, resource_type=resource_type)
+        res = delete_cloudinary_file(public_id, resource_type=resource_type, thread_id=thread_id)
     if filename:
         delete_uploaded_pdf(filename, thread_id=thread_id)
         
@@ -125,16 +127,34 @@ def delete_cloud_file_endpoint():
 
 @app.route("/api/storage_status", methods=["GET"])
 def storage_status_endpoint():
-    """Returns actual files present in Cloudinary and the local FAISS index status for this user."""
-    thread_id = request.args.get("thread_id", "default").strip() or "default"
+    """
+    Returns ONLY the files belonging to `thread_id`.
+    - If `thread_id` is a brand-new user, returns 0 files and `vector_index_ready: False`.
+    - If `thread_id` is a returning user who previously uploaded PDFs (stored in `agentic-rag-data/<thread_id>/`),
+      automatically restores their private FAISS index if local disk was reset.
+    """
+    thread_id = sanitize_thread_id(request.args.get("thread_id", "default"))
     try:
         uploaded_pdfs = list_uploaded_pdfs(thread_id=thread_id)
         cloud_files = list_cloud_storage_files(thread_id=thread_id, use_cache=True)
         user_vector_path = get_user_vector_path(thread_id)
-        has_index = os.path.exists(user_vector_path) and os.path.exists(os.path.join(user_vector_path, "index.faiss"))
+        index_file = os.path.join(user_vector_path, "index.faiss")
+        has_index = os.path.exists(index_file)
+
+        # Returning user auto-restore: if this user has their own PDFs in cloud/local but index is not built yet
+        if not has_index and (uploaded_pdfs or cloud_files):
+            print(f"[Storage Status] Returning user '{thread_id}' detected with {len(uploaded_pdfs) or len(cloud_files)} PDF(s). Restoring private index...", flush=True)
+            build_local_vector_db(thread_id=thread_id, force_sync=False)
+            uploaded_pdfs = list_uploaded_pdfs(thread_id=thread_id)
+            has_index = os.path.exists(index_file)
+
+        # If user has no PDFs at all, ensure vector_index_ready is False
+        if not uploaded_pdfs and not cloud_files:
+            has_index = False
         
         return jsonify({
             "success": True,
+            "thread_id": thread_id,
             "cloud_files": cloud_files,
             "cloud_file_count": len(cloud_files),
             "uploaded_pdfs": uploaded_pdfs,
@@ -156,14 +176,13 @@ def storage_status_endpoint():
 def update_knowledge_endpoint():
     print("\n====== 🔄 KNOWLEDGE BASE UPDATE REQUESTED ======", flush=True)
     data = request.json or {}
-    thread_id = data.get("thread_id") or request.args.get("thread_id", "default")
-    thread_id = thread_id.strip() or "default"
-    print(f"[Knowledge Engine] Syncing cloud assets for user: '{thread_id}'...", flush=True)
+    thread_id = sanitize_thread_id(data.get("thread_id") or request.args.get("thread_id", "default"))
+    print(f"[Knowledge Engine] Syncing private cloud assets for user: '{thread_id}'...", flush=True)
     
     captured_stdout = DualStream(thread_id=thread_id)
     try:
         with contextlib.redirect_stdout(captured_stdout):
-            print("⏳ [Pipeline] Checking storage and vector index...", flush=True)
+            print(f"⏳ [Pipeline] Checking private storage and vector index for '{thread_id}'...", flush=True)
             result = build_local_vector_db(thread_id=thread_id, force_sync=True)
 
         printed_logs = [line.strip() for line in captured_stdout.getvalue().splitlines() if line.strip()]
@@ -195,7 +214,7 @@ def chat_endpoint():
     data = request.json or {}
     user_query = data.get("message", "").strip()
     
-    thread_id = (data.get("thread_id") or "default").strip() or "default"
+    thread_id = sanitize_thread_id(data.get("thread_id") or "default")
     session_config = {"configurable": {"thread_id": thread_id}}
     
     if not user_query:

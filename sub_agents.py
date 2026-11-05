@@ -8,9 +8,9 @@ from dotenv import load_dotenv
 from llm_gateway import smart_gateway
 from tools.research import query_local_research_papers
 from tools.web_search import custom_web_search, custom_web_fetch
-from tools.file_system import save_file_to_disk
 
 load_dotenv()
+
 
 class FactSheet(BaseModel):
     summary: str = Field(description="Comprehensive summary of the findings answering the user's query.")
@@ -18,21 +18,66 @@ class FactSheet(BaseModel):
     sources_used: List[str] = Field(description="List of source filenames or URLs used.")
 
 
-def _is_document_or_resume_query(query: str) -> bool:
-    """Returns True if the user is asking about an uploaded PDF, resume, CV, or candidate profile."""
-    q = query.lower()
-    doc_keywords = [
-        "resume", "cv", "curriculum vitae", "deepan", "uploaded", "pdf",
-        "paper", "candidate", "his skills", "his experience", "his projects",
-        "his education", "according to his", "accoridng to his", "in the document"
-    ]
-    return any(k in q for k in doc_keywords)
+def _analyze_research_source_with_llm(user_query: str, pdf_excerpt: str, has_uploaded_pdfs: bool) -> dict:
+    """
+    100% LLM-driven decision on how to answer a research query (Zero hardcoded keyword lists):
+    - Determines whether the user is asking about their uploaded document/PDF/resume/knowledge base
+      or asking a general/live-web question.
+    - Evaluates whether the retrieved PDF chunks from the user's private FAISS index actually answer the question.
+    - Generates an optimized search query if live web search (Tavily) is needed.
+    """
+    prompt = (
+        "You are the Semantic Source Router for a Hybrid RAG + Web Search Sub-Agent.\n"
+        "Analyze the USER QUERY and the RETRIEVED LOCAL PDF EXCERPTS (if any) from the user's private knowledge base.\n"
+        "Do NOT rely on rigid keyword matching — understand the user's actual intent.\n\n"
+        "Return ONLY a valid JSON object with these exact keys:\n"
+        "{\n"
+        '  "is_asking_about_uploaded_docs": true | false,\n'
+        '  "pdf_context_answers_query": true | false,\n'
+        '  "optimized_web_query": "concise search engine query if web search is needed"\n'
+        "}\n\n"
+        "DECISION RULES:\n"
+        "1. 'is_asking_about_uploaded_docs': Set to true if the user's question is referring to their uploaded PDF, "
+        "document, paper, resume/CV, candidate profile, or private knowledge base (even if phrased indirectly like "
+        "'what are the skills mentioned?', 'summarize the file', 'who is the author?', 'what projects did he build?'). "
+        "Set to false if the user is asking for live external information (like current news in a city, weather, stock prices, "
+        "or general world/coding facts not about their uploaded file).\n"
+        "2. 'pdf_context_answers_query': Set to true if the RETRIEVED LOCAL PDF EXCERPTS contain relevant information "
+        "that answers or addresses the user's question. Set to false if no PDF excerpts are provided or if the PDF excerpts "
+        "are completely unrelated to the question (for example, the PDF is a resume, but the user asks 'what is the current news in Karur').\n"
+        "3. 'optimized_web_query': If web search is needed, write a clean, focused search engine query.\n\n"
+        f"USER HAS UPLOADED PDFS IN SESSION: {has_uploaded_pdfs}\n"
+        f"USER QUERY: {user_query}\n\n"
+        f"RETRIEVED LOCAL PDF EXCERPTS:\n{pdf_excerpt[:3000] if pdf_excerpt else 'NONE (User has no indexed PDF chunks)'}\n\n"
+        "Respond ONLY with the raw JSON object."
+    )
+
+    try:
+        res = smart_gateway.completion(messages=[{"role": "user", "content": prompt}])
+        raw = res.content.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw).strip()
+        s_idx, e_idx = raw.find("{"), raw.rfind("}")
+        if s_idx != -1 and e_idx != -1:
+            data = json.loads(raw[s_idx:e_idx + 1])
+            return {
+                "is_asking_about_uploaded_docs": bool(data.get("is_asking_about_uploaded_docs", False)),
+                "pdf_context_answers_query": bool(data.get("pdf_context_answers_query", False)),
+                "optimized_web_query": str(data.get("optimized_web_query") or user_query).strip(),
+            }
+    except Exception as e:
+        print(f"[Sub-Agent Warning] LLM source router fallback: {e}", flush=True)
+
+    return {
+        "is_asking_about_uploaded_docs": False,
+        "pdf_context_answers_query": bool(pdf_excerpt),
+        "optimized_web_query": user_query,
+    }
 
 
 def _extract_factsheet_from_context(user_query: str, raw_context: str, sources: List[str]) -> FactSheet:
     """
-    Compiles raw context into a verified FactSheet in a SINGLE fast LLM call via smart_gateway
-    (avoids slow multi-turn tool loops and 60s structured_output stalls).
+    Compiles raw context into a verified FactSheet in a SINGLE fast LLM call via smart_gateway.
     """
     t0 = time.time()
     print("[Sub-Agent] Compiling facts into structured schema...", flush=True)
@@ -54,7 +99,6 @@ def _extract_factsheet_from_context(user_query: str, raw_context: str, sources: 
     try:
         res = smart_gateway.completion(messages=[{"role": "user", "content": prompt}])
         text = res.content.strip()
-        # Strip markdown json fences if present
         text = re.sub(r'^```(?:json)?\s*', '', text)
         text = re.sub(r'\s*```$', '', text).strip()
 
@@ -75,7 +119,6 @@ def _extract_factsheet_from_context(user_query: str, raw_context: str, sources: 
     except Exception as e:
         print(f"[Sub-Agent Warning] Fast JSON parse fallback ({e}). Using direct text extraction.", flush=True)
 
-    # Instant deterministic fallback so the sub-agent NEVER hangs or crashes
     snippets = [line.strip() for line in raw_context.splitlines() if len(line.strip()) > 25][:6]
     if not snippets:
         snippets = [raw_context[:500].strip()] if raw_context.strip() else ["No relevant data found."]
@@ -88,20 +131,26 @@ def _extract_factsheet_from_context(user_query: str, raw_context: str, sources: 
 
 def hybrid_research_worker(user_query: str, thread_id: str = "default") -> FactSheet:
     """
-    Fast Hybrid Research Sub-Agent:
-    1. Immediately searches user's local FAISS RAG database (<10ms).
-    2. If relevant PDF chunks exist, extracts FactSheet in 1 fast LLM call (~1.5s).
-    3. If query requires live web data (and is not a private resume query), searches Tavily.
+    100% LLM-Guided Hybrid Research Sub-Agent:
+    1. Queries the active user's (`thread_id`) isolated FAISS RAG database.
+    2. Uses the LLM Semantic Source Router (`_analyze_research_source_with_llm`) to understand whether
+       the user is asking about their uploaded document or external web knowledge, and whether the PDF chunks
+       answer the question.
+    3. Routes to Private RAG extraction, Empty-Vault Notice (if asking about an uploaded doc when none is uploaded),
+       or Live Tavily Web Search accordingly.
     """
     t_start = time.time()
     print(f"\n[Sub-Agent] Starting research for: '{user_query}' (User: '{thread_id}')", flush=True)
-    print(f"[Sub-Agent] Checking user '{thread_id}' RAG database first...", flush=True)
+    print(f"[Sub-Agent] Checking user '{thread_id}' private RAG database...", flush=True)
 
     local_results = query_local_research_papers(user_query, top_k=5, thread_id=thread_id)
-    valid_chunks = [r for r in local_results if isinstance(r, dict) and "content_snippet" in r and r.get("content_snippet", "").strip()]
+    valid_chunks = [
+        r for r in local_results
+        if isinstance(r, dict) and "content_snippet" in r and r.get("content_snippet", "").strip()
+    ]
 
-    is_doc_query = _is_document_or_resume_query(user_query)
-
+    combined_pdf_text = ""
+    pdf_sources = []
     if valid_chunks:
         combined_pdf_text = "\n\n".join(
             f"[Source: {r.get('source_file', 'Uploaded PDF')}]\n{r['content_snippet']}"
@@ -109,42 +158,38 @@ def hybrid_research_worker(user_query: str, thread_id: str = "default") -> FactS
         )
         pdf_sources = list(dict.fromkeys(r.get("source_file", "Uploaded PDF") for r in valid_chunks))
 
-        # If user is explicitly asking about the resume/PDF, immediately use the PDF chunks!
-        if is_doc_query:
-            print("[Sub-Agent] ✅ RAG Match: Resume/Document query matched uploaded PDF(s). Bypassing live web crawling.", flush=True)
-            sheet = _extract_factsheet_from_context(user_query, combined_pdf_text, pdf_sources)
-            print(f"[Sub-Agent] 🏁 Research complete in {time.time() - t_start:.2f}s. Extracted {len(sheet.verified_facts)} facts.", flush=True)
-            return sheet
+    # Ask the LLM Semantic Router to evaluate the query and retrieved PDF context
+    routing_decision = _analyze_research_source_with_llm(
+        user_query=user_query,
+        pdf_excerpt=combined_pdf_text,
+        has_uploaded_pdfs=bool(valid_chunks)
+    )
+    print(
+        f"[Sub-Agent] LLM Source Decision -> AskingAboutDocs: {routing_decision['is_asking_about_uploaded_docs']} "
+        f"| PDFMatchesQuery: {routing_decision['pdf_context_answers_query']}",
+        flush=True
+    )
 
-        # Otherwise do a quick relevance check in <1s
-        gate_prompt = (
-            "Does the following PDF excerpt contain information that answers the user's question?\n"
-            "Reply with ONLY 'YES' or 'NO'.\n\n"
-            f"Question: {user_query}\n\n"
-            f"PDF Excerpt:\n{combined_pdf_text[:2500]}"
-        )
-        try:
-            gate_res = smart_gateway.completion(messages=[{"role": "user", "content": gate_prompt}])
-            if "YES" in gate_res.content.strip().upper():
-                print("[Sub-Agent] ✅ RAG Match: Context found in uploaded PDF(s). Bypassing live web crawling.", flush=True)
-                sheet = _extract_factsheet_from_context(user_query, combined_pdf_text, pdf_sources)
-                print(f"[Sub-Agent] 🏁 Research complete in {time.time() - t_start:.2f}s. Extracted {len(sheet.verified_facts)} facts.", flush=True)
-                return sheet
-        except Exception as e:
-            print(f"[Sub-Agent Warning] Gate check error: {e}", flush=True)
+    # Case 1: The user's private PDF chunks answer the query
+    if valid_chunks and (routing_decision["pdf_context_answers_query"] or routing_decision["is_asking_about_uploaded_docs"]):
+        print("[Sub-Agent] ✅ RAG Match: Answering from user's private uploaded PDF(s). Bypassing web search.", flush=True)
+        sheet = _extract_factsheet_from_context(user_query, combined_pdf_text, pdf_sources)
+        print(f"[Sub-Agent] 🏁 Research complete in {time.time() - t_start:.2f}s. Extracted {len(sheet.verified_facts)} facts.", flush=True)
+        return sheet
 
-    # If the user asked about a resume/document and no PDF chunks were found, do not leak/confuse with public web search
-    if is_doc_query and not valid_chunks:
-        print("[Sub-Agent] 🛡️ Resume/Document query with no indexed text. Skipping web search.", flush=True)
+    # Case 2: The user is asking about their uploaded PDF/document/resume, but this user has NOT uploaded any PDF
+    if routing_decision["is_asking_about_uploaded_docs"] and not valid_chunks:
+        print(f"[Sub-Agent] 🛡️ User '{thread_id}' asked about an uploaded document, but their RAG store is empty.", flush=True)
         return FactSheet(
-            summary="No uploaded PDF or resume was found in the knowledge base for this user session. Please upload the PDF in the left sidebar or click 'Sync Cloud Assets'.",
-            verified_facts=["No indexed PDF chunks were found in the local vector store for this session."],
-            sources_used=["Local RAG Database"]
+            summary=f"No uploaded PDF documents were found in the private knowledge base for user '{thread_id}'. Please upload a PDF in the left sidebar first to ask questions about your documents.",
+            verified_facts=[f"User '{thread_id}' currently has 0 indexed PDF documents in their private RAG knowledge base."],
+            sources_used=["Private RAG Database (Empty)"]
         )
 
-    # Stage 4: Live Web Search via Tavily
-    print(f"[Sub-Agent] 🌐 Querying live web search (Tavily) for: '{user_query}'...", flush=True)
-    search_results = custom_web_search(user_query, max_results=3)
+    # Case 3: Live Web Search via Tavily using the LLM's optimized search query
+    web_query = routing_decision["optimized_web_query"] or user_query
+    print(f"[Sub-Agent] 🌐 Querying live web search (Tavily) for: '{web_query}'...", flush=True)
+    search_results = custom_web_search(web_query, max_results=3)
     valid_urls = [r for r in search_results if isinstance(r, dict) and "url" in r]
 
     web_contexts = []

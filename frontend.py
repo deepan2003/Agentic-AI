@@ -5,7 +5,6 @@ import re
 import time
 import threading
 from datetime import datetime
-import uuid
 
 st.set_page_config(page_title="Agentic RAG Gateway", page_icon="🤖", layout="wide")
 st.title("🤖 Intelligent Enterprise RAG Gateway")
@@ -20,11 +19,23 @@ STORAGE_STATUS_URL = f"{BACKEND_URL}/api/storage_status"
 UPLOAD_PDF_URL = f"{BACKEND_URL}/api/upload_pdf"
 DELETE_CLOUD_FILE_URL = f"{BACKEND_URL}/api/delete_cloud_file"
 
-# --- USER IDENTIFICATION SYSTEM (LOCKED STATE) ---
+
+def sanitize_user_id(user_id: str) -> str:
+    """Normalizes username into a safe lowercase identifier so User A and User B are strictly isolated."""
+    if not user_id:
+        return ""
+    return re.sub(r'[^a-zA-Z0-9_\-]', '_', str(user_id).strip().lower()).strip('_')
+
+
+# --- USER IDENTIFICATION SYSTEM (WITH SWITCH USER / LOGOUT) ---
 st.sidebar.title("👤 User Profile")
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
+
+if "user_messages_map" not in st.session_state:
+    # Keeps per-user UI chat history in browser session so returning User A sees their messages too
+    st.session_state.user_messages_map = {}
 
 if not st.session_state.thread_id:
     with st.sidebar.form(key="login_form"):
@@ -32,14 +43,27 @@ if not st.session_state.thread_id:
         login_submitted = st.form_submit_button("🚀 Connect / Login", use_container_width=True)
         
     if (login_submitted or user_id_input) and user_id_input.strip():
-        st.session_state.thread_id = user_id_input.strip()
-        st.session_state.messages = [] 
+        clean_uid = sanitize_user_id(user_id_input)
+        st.session_state.thread_id = clean_uid
+        # Restore this user's UI messages if they previously logged in during this browser session
+        st.session_state.messages = list(st.session_state.user_messages_map.get(clean_uid, []))
+        st.session_state.last_indexed_pdf = None
+        st.session_state.file_to_delete = None
         st.rerun() 
     else:
-        st.warning("👈 Please enter your Username in the sidebar to securely connect to your personal chat history thread.")
+        st.warning("👈 Please enter your Username in the sidebar to securely connect to your personal RAG knowledge base and chat thread.")
         st.stop()
 else:
-    st.sidebar.success(f"Verified User: **{st.session_state.thread_id}**")
+    col_user, col_logout = st.sidebar.columns([3, 1])
+    col_user.success(f"Verified User: **{st.session_state.thread_id}**")
+    if col_logout.button("🚪", help="Logout / Switch User", use_container_width=True):
+        # Save current user's UI messages before logging out so when User A comes back, their chat is still there
+        st.session_state.user_messages_map[st.session_state.thread_id] = list(st.session_state.get("messages", []))
+        st.session_state.thread_id = None
+        st.session_state.messages = []
+        st.session_state.last_indexed_pdf = None
+        st.session_state.file_to_delete = None
+        st.rerun()
 
 
 if "messages" not in st.session_state:
@@ -53,24 +77,27 @@ if "cost_date" not in st.session_state or st.session_state.cost_date != current_
     st.session_state.cost_date = current_date
 
 
-# --- Sidebar Document Explorer ---
+# --- Sidebar Document Explorer (STRICTLY ISOLATED PER USER) ---
 st.sidebar.markdown("---")
 st.sidebar.title("📂 Saved Documents")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
+USER_PROJECTS_DIR = os.path.join(BASE_DIR, "projects", sanitize_user_id(st.session_state.thread_id))
 
-if not os.path.exists(PROJECTS_DIR):
-    os.makedirs(PROJECTS_DIR)
+if not os.path.exists(USER_PROJECTS_DIR):
+    os.makedirs(USER_PROJECTS_DIR, exist_ok=True)
 
-saved_files = [f for f in os.listdir(PROJECTS_DIR) if os.path.isfile(os.path.join(PROJECTS_DIR, f)) and f != "agent.md"]
+saved_files = sorted([
+    f for f in os.listdir(USER_PROJECTS_DIR)
+    if os.path.isfile(os.path.join(USER_PROJECTS_DIR, f)) and f != "agent.md"
+])
 
 if "file_to_delete" not in st.session_state:
     st.session_state.file_to_delete = None
 
 if saved_files:
-    st.sidebar.write("📥 Click to download or manage reports:")
+    st.sidebar.write("📥 Click to download or manage your reports:")
     for file_name in saved_files:
-        file_path = os.path.join(PROJECTS_DIR, file_name)
+        file_path = os.path.join(USER_PROJECTS_DIR, file_name)
         
         col_doc, col_del = st.sidebar.columns([4, 1])
         
@@ -79,11 +106,11 @@ if saved_files:
                 label=f"📄 {file_name}",
                 data=file_data,
                 file_name=file_name,
-                key=f"download_{file_name}",
+                key=f"download_{st.session_state.thread_id}_{file_name}",
                 use_container_width=True
             )
         
-        if col_del.button("❌", key=f"del_btn_{file_name}", help=f"Delete {file_name}"):
+        if col_del.button("❌", key=f"del_btn_{st.session_state.thread_id}_{file_name}", help=f"Delete {file_name}"):
             st.session_state.file_to_delete = file_name
             st.rerun()
 
@@ -95,7 +122,7 @@ if saved_files:
         col_yes, col_no = st.sidebar.columns(2)
         if col_yes.button("✅ Yes", key="confirm_delete_yes", use_container_width=True):
             try:
-                os.remove(os.path.join(PROJECTS_DIR, target_file))
+                os.remove(os.path.join(USER_PROJECTS_DIR, target_file))
                 st.sidebar.success(f"Deleted {target_file}!")
                 st.session_state.file_to_delete = None
                 st.rerun()
@@ -106,24 +133,27 @@ if saved_files:
             st.session_state.file_to_delete = None
             st.rerun()
 else:
-    st.sidebar.info("No documents saved yet.")
+    st.sidebar.info(f"No documents saved yet for **{st.session_state.thread_id}**.")
 
 
-# --- Sidebar Knowledge Base Management ---
+# --- Sidebar Knowledge Base Management (STRICTLY ISOLATED PER USER) ---
 st.sidebar.markdown("---")
 st.sidebar.title("🧠 Core Knowledge Management")
-st.sidebar.caption("Upload or sync PDF documents directly into active vector indexes.")
+st.sidebar.caption(f"Private RAG Knowledge Base for **{st.session_state.thread_id}**")
 
+# Scope the uploader key to the active user so User B never sees User A's uploaded file widget state
+uploader_key = f"knowledge_pdf_uploader_{st.session_state.thread_id}"
 uploaded_pdf = st.sidebar.file_uploader(
-    "📤 Upload PDF to Knowledge Base", 
+    "📤 Upload PDF to Your Private Knowledge Base", 
     type=["pdf"], 
-    key="knowledge_pdf_uploader",
-    help="Upload research papers or documents to immediately ground agent responses."
+    key=uploader_key,
+    help="Uploaded PDFs are strictly isolated to your username and automatically restored when you return."
 )
 
 if uploaded_pdf is not None:
-    if "last_indexed_pdf" not in st.session_state or st.session_state.last_indexed_pdf != uploaded_pdf.name:
-        with st.sidebar.status(f"⚙️ Indexing '{uploaded_pdf.name}' into RAG...", expanded=True):
+    last_indexed_key = f"{st.session_state.thread_id}:{uploaded_pdf.name}"
+    if st.session_state.get("last_indexed_pdf") != last_indexed_key:
+        with st.sidebar.status(f"⚙️ Indexing '{uploaded_pdf.name}' into {st.session_state.thread_id}'s RAG...", expanded=True):
             try:
                 files = {"file": (uploaded_pdf.name, uploaded_pdf.getvalue(), "application/pdf")}
                 data = {"thread_id": st.session_state.thread_id}
@@ -131,14 +161,14 @@ if uploaded_pdf is not None:
                 if up_res.status_code == 200:
                     res_data = up_res.json()
                     st.sidebar.success(f"✅ Indexed '{uploaded_pdf.name}' ({res_data.get('chunks', 0)} chunks)!")
-                    st.session_state.last_indexed_pdf = uploaded_pdf.name
+                    st.session_state.last_indexed_pdf = last_indexed_key
                     st.rerun()
                 else:
                     st.sidebar.error("Failed to index PDF.")
             except Exception as e:
                 st.sidebar.error(f"Error processing PDF upload: {e}")
 
-# Fetch real-time storage and index status for this user
+# Fetch real-time storage and index status strictly for this user
 try:
     status_res = requests.get(STORAGE_STATUS_URL, params={"thread_id": st.session_state.thread_id}, timeout=5)
     if status_res.status_code == 200:
@@ -147,22 +177,40 @@ try:
         cloud_files = storage_data.get("cloud_files", [])
         index_ready = storage_data.get("vector_index_ready", False)
 
-        st.sidebar.markdown("#### 📚 Active Knowledge Base Files")
+        st.sidebar.markdown("#### 📚 Your Active Knowledge Base Files")
         if uploaded_pdfs:
             for up in uploaded_pdfs:
-                st.sidebar.markdown(f"- 📄 **`{up['filename']}`** ({up['size_kb']} KB)")
+                c_pdf, c_del_pdf = st.sidebar.columns([4, 1])
+                c_pdf.markdown(f"- 📄 **`{up['filename']}`** ({up['size_kb']} KB)")
+                if c_del_pdf.button("🗑️", key=f"del_local_pdf_{st.session_state.thread_id}_{up['filename']}", help=f"Remove {up['filename']}"):
+                    try:
+                        # Also find matching cloud public_id if backed up
+                        matching_pub_id = next((cf["public_id"] for cf in cloud_files if cf["filename"] == up["filename"]), None)
+                        requests.post(
+                            DELETE_CLOUD_FILE_URL,
+                            json={
+                                "public_id": matching_pub_id,
+                                "filename": up["filename"],
+                                "resource_type": "raw",
+                                "thread_id": st.session_state.thread_id
+                            },
+                            timeout=15
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        st.sidebar.error(f"Delete failed: {e}")
         elif cloud_files:
             for cf in cloud_files:
                 size_kb = cf.get("bytes", 0) / 1024
                 st.sidebar.markdown(f"- 📄 **`{cf['filename']}`** ({size_kb:.1f} KB)")
         else:
-            st.sidebar.warning("⚠️ No documents indexed yet. Use the upload box above to add your first PDF!")
+            st.sidebar.warning(f"⚠️ Knowledge base for **{st.session_state.thread_id}** is empty. Upload a PDF above to enable RAG!")
 
         st.sidebar.markdown(f"**Vector Store Status:** {'🟢 Active & Loaded' if index_ready else '🔴 Empty / Waiting for PDF'}")
 
-        with st.sidebar.expander("☁️ Cloud Storage (Cloudinary)", expanded=False):
+        with st.sidebar.expander("☁️ Your Cloud Backup (Cloudinary)", expanded=False):
             if cloud_files:
-                st.write(f"**{len(cloud_files)} file(s) in Cloudinary:**")
+                st.write(f"**{len(cloud_files)} file(s) backed up for `{st.session_state.thread_id}`:**")
                 for cf in cloud_files:
                     c1, c2 = st.columns([3, 1])
                     c1.write(f"📄 `{cf['filename']}` ({cf.get('bytes', 0)/1024:.1f} KB)")
@@ -180,15 +228,15 @@ try:
                         except Exception as e:
                             st.error(f"Delete failed: {e}")
             else:
-                st.caption("No files currently detected in Cloudinary folder `agentic-rag-data`.")
+                st.caption(f"No cloud files found for user `{st.session_state.thread_id}`.")
 except Exception:
     st.sidebar.caption("Backend offline: cannot check knowledge status.")
 
 # 3. Cloudinary Sync Button
-if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
+if st.sidebar.button("🔄 Sync My Cloud Assets to RAG"):
     pipeline_container = st.empty()
     
-    with pipeline_container.status("🛸 Syncing cloud storage & building index...", expanded=True) as pipe_status:
+    with pipeline_container.status("🛸 Syncing your private cloud storage & building index...", expanded=True) as pipe_status:
         try:
             payload = {"thread_id": st.session_state.thread_id}
             response = requests.post(UPDATE_API_URL, json=payload, timeout=120)
@@ -205,7 +253,7 @@ if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
                 
                 if is_success and file_count > 0:
                     pipe_status.update(label="✅ Knowledge Base Update Complete!", state="complete")
-                    st.sidebar.success(f"Success! {file_count} document(s) indexed into RAG.")
+                    st.sidebar.success(f"Success! {file_count} document(s) indexed into your private RAG.")
                     st.rerun()
                 else:
                     pipe_status.update(label="⚠️ Sync Finished: No Files Found", state="complete")
@@ -246,6 +294,7 @@ if user_input := st.chat_input("Ask a question or request a technical function..
     
     st.chat_message("user").markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.user_messages_map[st.session_state.thread_id] = list(st.session_state.messages)
     
     with st.chat_message("assistant"):
         log_status = st.status("🤖 Orchestrator running — Live Backend Logs:", expanded=True)
@@ -315,6 +364,10 @@ if user_input := st.chat_input("Ask a question or request a technical function..
                     "content": agent_answer,
                     "logs": execution_logs
                 })
+                st.session_state.user_messages_map[st.session_state.thread_id] = list(st.session_state.messages)
+                # If a document was saved during this turn, rerun so the sidebar immediately displays the new file button
+                if any("Physical file saved to disk" in l for l in execution_logs):
+                    st.rerun()
             else:
                 err_msg = "Error communicating with backend processing nodes."
                 err_logs = last_seen_logs
