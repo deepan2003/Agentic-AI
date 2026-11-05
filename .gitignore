@@ -5,7 +5,8 @@
 *.png
 *.json
 *.pem
-
+*.pdf
+/data_uploads
 /tmp_downloads
 /__pycache__
 /vector_store

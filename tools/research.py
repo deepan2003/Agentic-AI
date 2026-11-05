@@ -1,28 +1,14 @@
 import os
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_openai import OpenAIEmbeddings
 
 VECTOR_DB_PATH = "./vector_store/research_papers"
-_embeddings = None
 
 def get_embeddings():
     """
-    Returns FastEmbed CPU ONNX quantized model (~30MB RAM, zero PyTorch, 100% reliable).
+    Returns unified FastEmbed CPU ONNX quantized model (~30MB RAM, zero PyTorch, 100% reliable).
     """
-    global _embeddings
-    if _embeddings is None:
-        try:
-            from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
-            print("[System] Using FastEmbed CPU ONNX quantized embeddings (~30MB RAM)...", flush=True)
-            _embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-            return _embeddings
-        except Exception as e:
-            print(f"[System Warning] FastEmbed fallback: {e}")
-            
-        print("[System] Loading HuggingFace embedding weights into RAM...", flush=True)
-        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    return _embeddings
+    from ingestion import get_embedding_model
+    return get_embedding_model()
 
 def query_local_research_papers(query_str: str, top_k: int = 3, thread_id: str = "default") -> list:
     """

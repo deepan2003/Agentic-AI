@@ -80,121 +80,140 @@ def hybrid_research_worker(query: str, thread_id: str = "default") -> FactSheet:
         temperature=0.0
     )
     
-    # 2. Gather data from this specific user's isolated PDF Vector DB
-    print(f"[Sub-Agent] Searching user '{thread_id}' research database...", flush=True)
-    local_data = query_local_research_papers(query, top_k=2, thread_id=thread_id)
+    # ====================================================================
+    # 2. 📚 STEP 1: ALWAYS SEARCH LOCAL RAG FIRST
+    # ====================================================================
+    print(f"[Sub-Agent] Checking user '{thread_id}' RAG database first...", flush=True)
+    local_data = query_local_research_papers(query, top_k=5, thread_id=thread_id)
     
-    # Extract raw text snippet from local files to verify content relevance
+    query_lower = query.lower()
+    is_doc_query = any(ind in query_lower for ind in [
+        "resume", "cv", "pdf", "paper", "document", "uploaded", "rag", "system", 
+        "profile", "candidate", "deepan", "experience", "education", "skill", "who is", "role", "fit"
+    ])
+    
+    # If user asks for general document overview, expand search with profile keywords
+    if is_doc_query and len(local_data) < 3:
+        broad_data = query_local_research_papers("profile summary experience skills education projects background", top_k=5, thread_id=thread_id)
+        seen_snippets = {d.get("content_snippet", "") for d in local_data}
+        for bd in broad_data:
+            if bd.get("content_snippet", "") not in seen_snippets and "error" not in bd:
+                local_data.append(bd)
+                seen_snippets.add(bd.get("content_snippet", ""))
+
     local_text_snippet = ""
     for doc in local_data:
         if "error" not in doc:
-            local_text_snippet += f"{doc['content_snippet']}\n"
-            
-    # 3. 🧠 Smart Relevancy Check: Does the PDF actually answer the question?
-    is_local_relevant = "NO"
+            local_text_snippet += f"{doc.get('content_snippet', '')}\n"
+
+    # Smart Relevancy Check: Does the local PDF answer or relate to the query?
+    is_local_relevant = False
     if local_text_snippet.strip():
-        relevancy_prompt = (
-            f"User Question: {query}\n"
-            f"Local PDF Context:\n{local_text_snippet}\n\n"
-            f"Does the Local PDF Context explicitly contain the factual answer to the User Question? "
-            f"Answer ONLY with 'YES' or 'NO' and absolutely nothing else."
-        )
-        check_response = llm.invoke(relevancy_prompt).content.strip().upper()
-        if "YES" in check_response:
-            is_local_relevant = "YES"
+        if is_doc_query:
+            # User specifically asked about the document / resume / RAG
+            is_local_relevant = True
+        else:
+            relevancy_prompt = (
+                f"User Question: {query}\n"
+                f"Local Document Snippets:\n{local_text_snippet[:2000]}\n\n"
+                f"Does the Local Document contain information related to or answering the user's question? "
+                f"Answer 'YES' if it relates or can answer; answer 'NO' ONLY if completely unrelated. Answer ONLY 'YES' or 'NO'."
+            )
+            try:
+                check_response = llm.invoke(relevancy_prompt).content.strip().upper()
+                if "YES" in check_response:
+                    is_local_relevant = True
+            except Exception:
+                is_local_relevant = True
 
     # Containers for search findings
     web_data = []
-    tavily_data = ""
     combined_context = ""
 
-    # 4. Routing Decision Branch
-    if is_local_relevant == "YES":
-        print("[Sub-Agent] Relevant match discovered in local PDFs. Bypassing live web crawling.", flush=True)
-        
-        combined_context += "--- LOCAL RESEARCH PAPERS EXTRACTS ---\n"
+    # ====================================================================
+    # 3. 🌐 STEP 2: RAG MATCH vs LIVE TAVILY SEARCH FALLBACK
+    # ====================================================================
+    if is_local_relevant:
+        print("[Sub-Agent] ✅ RAG Match: Context found in uploaded PDF(s). Bypassing live web crawling.", flush=True)
+        combined_context += "--- LOCAL KNOWLEDGE BASE (PDF) EXTRACTS ---\n"
         for doc in local_data:
             if "error" not in doc:
-                combined_context += f"Source: {doc['source_file']}\nContent: {doc['content_snippet']}\n\n"
+                combined_context += f"Source: {doc.get('source_file', 'Uploaded PDF')}\nContent: {doc.get('content_snippet', '')}\n\n"
     else:
-        print("[Sub-Agent] Local PDFs do not contain the answer. Clear fallback to live web search...", flush=True)
-        
-        # Gather data from live web links
-        print("[Sub-Agent] Searching the live web...", flush=True)
+        print("[Sub-Agent] 🌐 No local RAG match. Falling back to Tavily live web search...", flush=True)
         web_links = custom_web_search(query, max_results=1)
-        
         for link in web_links:
             if "url" in link:
                 content = custom_web_fetch(link["url"])
                 web_data.append(content)
 
-        # Build dynamic context string for web fetches
         combined_context += "--- LIVE WEB EXTRACTS ---\n"
         for page in web_data:
             combined_context += f"Source: {page['url']}\nContent: {page['content']}\n\n"
 
-        # Query Optimizer for Tavily Engine
-        print("[Sub-Agent] Optimizing search query for Tavily...", flush=True)
         from datetime import datetime
         current_year = datetime.now().year
-        
         optimizer_prompt = f"""
-        You are an expert search query generator. 
-        CURRENT SYSTEM YEAR: {current_year}.
-        
+        You are an expert search query generator. CURRENT SYSTEM YEAR: {current_year}.
         Convert the user's conversational question into a strict, highly targeted search engine keyword string.
-
-        CRITICAL RULES:
-        1. If the user asks about "current", "now", "present", or today's facts, you MUST append the year "{current_year}" to the search keywords to avoid outdated results.
-        2. If the user explicitly asks about a specific past or future year (e.g., 2021, 2015), use their requested year INSTEAD of {current_year}.
-        3. Do NOT include conversational words like "who is", "what is", "say in short", or "tell me".
-        4. Only output the raw keywords.
-
-        Examples: 
-        - "who is current cm of tamilnadu" -> "current Chief Minister Tamil Nadu {current_year}"
-        - "who was cm of tamilnadu in 2021" -> "Chief Minister Tamil Nadu 2021"
-
         User Question: {query}
         """
-        optimized_query = llm.invoke(optimizer_prompt).content.strip()
-        
-        print("[Sub-Agent] Gathering live data from Tavily...", flush=True)
-        tavily_search = TavilySearch(
-            max_results=1,              # Only grab the single best search result
-            search_depth="basic",        # Prevents slow, deep-web crawling
-            include_raw_content=False    # Blocks massive HTML blocks from bloating the tokens
-        )
-        tavily_data = tavily_search.invoke({"query": optimized_query})
-        combined_context += f"--- TAVILY LIVE NEWS ---\n{tavily_data}\n\n"
+        try:
+            optimized_query = llm.invoke(optimizer_prompt).content.strip()
+            tavily_search = TavilySearch(max_results=1, search_depth="basic", include_raw_content=False)
+            tavily_data = tavily_search.invoke({"query": optimized_query})
+            combined_context += f"--- TAVILY LIVE NEWS ---\n{tavily_data}\n\n"
+        except Exception as e:
+            print(f"[Sub-Agent Warning] Tavily search error: {e}", flush=True)
 
     # ====================================================================
-    # 5. ACTIVE TOOL EXECUTION LOOP (Coding + File System)
+    # 4. 💻 STEP 3: CODING TASK PRIORITY (CHECK RAG FIRST -> RUN CODE TOOL)
     # ====================================================================
-    needs_tools = any(kw in query.lower() for kw in ["code", "python", "calculate", "math", "save", "write to", "create a file", "export"])
-    if needs_tools:
-        print("[Sub-Agent] Active tool required. Invoking tool execution agent...", flush=True)
-        tool_agent = create_react_agent(llm, tools=[execute_python_code, save_file_to_disk])
-        
-        tool_instructions = (
-            f"You are a tool execution agent.\n"
-            f"- If the user asks for math/coding, use 'execute_python_code'.\n"
-            f"- If the user asks to save/create a file, use 'save_file_to_disk'.\n"
-            f"- CRITICAL JSON RULE: When using 'save_file_to_disk', you MUST pass the content to the tool as ONE single, continuous paragraph without unescaped newlines or quotes.\n\n"
-            f"RESEARCH CONTEXT:\n{combined_context}\n\n"
-            f"User Query: {query}"
-        )
+    is_coding_task = any(kw in query_lower for kw in ["code", "python", "script", "function", "algorithm", "calculate", "math", "run "])
+    if is_coding_task:
+        has_code_in_rag = is_local_relevant and any(marker in local_text_snippet.lower() for marker in [
+            "def ", "class ", "import ", "return ", "for ", "while ", "function", "lambda", "const "
+        ])
+        user_wants_execution = any(act in query_lower for act in ["execute", "run ", "test the code", "calculate", "compute", "solve"])
 
-        tool_results = tool_agent.invoke(
-            {"messages": [("user", tool_instructions)]},
-            config={"recursion_limit": 5}
-        )
-        final_tool_answer = tool_results["messages"][-1].content
-        combined_context += f"--- ACTIVE TOOL RESULTS ---\n{final_tool_answer}\n\n"
-    else:
-        print("[Sub-Agent] Standard informational query. Skipping redundant tool agent to optimize latency and memory.", flush=True)
+        if has_code_in_rag and not user_wants_execution:
+            print("[Sub-Agent] Code found in local PDF RAG context. Using document code.", flush=True)
+        else:
+            print("[Sub-Agent] Code not in PDF or execution requested. Running Python sandbox tool...", flush=True)
+            tool_agent = create_react_agent(llm, tools=[execute_python_code, save_file_to_disk])
+            tool_instructions = (
+                f"You are a coding and execution agent.\n"
+                f"- If math calculation, code generation, or execution is needed, run it using 'execute_python_code'.\n"
+                f"- If the user asks to save/create a file, use 'save_file_to_disk'.\n"
+                f"CONTEXT:\n{combined_context}\n\n"
+                f"User Query: {query}"
+            )
+            try:
+                tool_results = tool_agent.invoke(
+                    {"messages": [("user", tool_instructions)]},
+                    config={"recursion_limit": 5}
+                )
+                final_tool_answer = tool_results["messages"][-1].content
+                combined_context += f"--- PYTHON CODE EXECUTION RESULTS ---\n{final_tool_answer}\n\n"
+            except Exception as te:
+                print(f"[Sub-Agent Warning] Tool execution note: {te}", flush=True)
+
+    # File save tool trigger if requested and not yet run
+    if any(kw in query_lower for kw in ["save", "write to", "create a file", "export"]) and "save_file_to_disk" not in combined_context:
+        print("[Sub-Agent] File creation requested. Invoking save_file_to_disk tool...", flush=True)
+        tool_agent = create_react_agent(llm, tools=[save_file_to_disk])
+        try:
+            tool_results = tool_agent.invoke(
+                {"messages": [("user", f"Save the required content using save_file_to_disk.\nContext: {combined_context}\nQuery: {query}")]},
+                config={"recursion_limit": 3}
+            )
+            combined_context += f"--- FILE SAVE RESULT ---\n{tool_results['messages'][-1].content}\n\n"
+        except Exception as fe:
+            print(f"[Sub-Agent Warning] File save note: {fe}", flush=True)
+
     # ====================================================================
-
-    # 6. Final Output Structuring Block (Robust JSON Generation without fragile tool-calling)
+    # 5. 📋 STEP 4: FINAL OUTPUT STRUCTURING (FACT SHEET)
+    # ====================================================================
     system_prompt = (
         "You are an elite research assistant. Analyze the provided context extracts thoroughly.\n\n"
         "Generate a strictly formatted JSON object matching this structure:\n"
@@ -207,8 +226,8 @@ def hybrid_research_worker(query: str, thread_id: str = "default") -> FactSheet:
         '  "sources_used": ["source 1", "source 2"]\n'
         "}\n\n"
         "CRITICAL RULES:\n"
-        "1. List EVERY SINGLE news headline, statistical figure, or factual finding as an individual string in 'verified_facts'.\n"
-        "2. Keep the JSON 100% syntactically valid. Escape any internal quotes with \\\". Do not include markdown code fences or backticks.\n"
+        "1. List EVERY SINGLE factual finding, skill, project, experience, or headline as an individual string in 'verified_facts'.\n"
+        "2. Keep the JSON 100% syntactically valid. Escape internal quotes with \\\". Do not include markdown code fences.\n"
         "3. Output ONLY the JSON object and nothing else."
     )
 
@@ -219,5 +238,15 @@ def hybrid_research_worker(query: str, thread_id: str = "default") -> FactSheet:
     ])
     
     fact_sheet_object = parse_fact_sheet(response.content, combined_context)
+    
+    # Ensure source documents are listed
+    if is_local_relevant:
+        for doc in local_data:
+            sf = doc.get("source_file", "")
+            if sf and sf != "Unknown":
+                base_sf = os.path.basename(sf)
+                if base_sf not in fact_sheet_object.sources_used:
+                    fact_sheet_object.sources_used.append(base_sf)
+
     print(f"[Sub-Agent] Research complete. Extracted {len(fact_sheet_object.verified_facts)} verified facts.", flush=True)
     return fact_sheet_object
