@@ -24,20 +24,21 @@ def get_embeddings():
         _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return _embeddings
 
-def query_local_research_papers(query_str: str, top_k: int = 3) -> list:
+def query_local_research_papers(query_str: str, top_k: int = 3, thread_id: str = "default") -> list:
     """
-    Searches the internal local vector database for research papers and academic context.
-    If no vector index exists or index is empty, returns empty list without loading PyTorch/embeddings!
+    Searches the user's isolated local vector database for uploaded PDFs.
+    If no vector index exists for this user, returns empty list without loading embeddings.
     """
-    index_file = os.path.join(VECTOR_DB_PATH, "index.faiss")
+    from ingestion import get_user_vector_path
+    user_vector_path = get_user_vector_path(thread_id)
+    index_file = os.path.join(user_vector_path, "index.faiss")
     if not os.path.exists(index_file):
-        # DO NOT load HuggingFace embeddings weights into RAM if no PDF index exists!
         return []
         
     try:
-        # Load the local database using lazy-loaded embeddings
+        # Load the user's isolated vector database
         embeddings = get_embeddings()
-        vector_db = FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization=True)
+        vector_db = FAISS.load_local(user_vector_path, embeddings, allow_dangerous_deserialization=True)
         
         # Search for the best matches
         docs = vector_db.similarity_search_with_score(query_str, k=top_k)
@@ -51,4 +52,4 @@ def query_local_research_papers(query_str: str, top_k: int = 3) -> list:
             })
         return results
     except Exception as e:
-        return [{"error": f"Failed to search local database: {str(e)}"}]
+        return [{"error": f"Failed to search user database: {str(e)}"}]

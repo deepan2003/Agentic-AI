@@ -69,8 +69,8 @@ def parse_fact_sheet(raw_content: str, combined_context: str) -> FactSheet:
         sources_used=[]
     )
 
-def hybrid_research_worker(query: str) -> FactSheet:
-    print(f"\n[Sub-Agent] Starting research for: '{query}'", flush=True)
+def hybrid_research_worker(query: str, thread_id: str = "default") -> FactSheet:
+    print(f"\n[Sub-Agent] Starting research for: '{query}' (User: '{thread_id}')", flush=True)
     
     # 1. Initialize Groq LLM early for internal evaluations
     llm = ChatOpenAI(
@@ -80,9 +80,9 @@ def hybrid_research_worker(query: str) -> FactSheet:
         temperature=0.0
     )
     
-    # 2. Gather data from your local PDF Vector DB
-    print("[Sub-Agent] Searching local research database...", flush=True)
-    local_data = query_local_research_papers(query, top_k=2)
+    # 2. Gather data from this specific user's isolated PDF Vector DB
+    print(f"[Sub-Agent] Searching user '{thread_id}' research database...", flush=True)
+    local_data = query_local_research_papers(query, top_k=2, thread_id=thread_id)
     
     # Extract raw text snippet from local files to verify content relevance
     local_text_snippet = ""

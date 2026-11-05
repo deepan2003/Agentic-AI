@@ -130,7 +130,8 @@ if uploaded_pdf is not None:
         with st.sidebar.status(f"⚙️ Indexing '{uploaded_pdf.name}' into RAG..."):
             try:
                 files = {"file": (uploaded_pdf.name, uploaded_pdf.getvalue(), "application/pdf")}
-                up_res = requests.post(UPLOAD_PDF_URL, files=files, timeout=120)
+                data = {"thread_id": st.session_state.thread_id}
+                up_res = requests.post(UPLOAD_PDF_URL, files=files, data=data, timeout=120)
                 if up_res.status_code == 200:
                     res_data = up_res.json()
                     st.sidebar.success(f"✅ Indexed '{uploaded_pdf.name}' ({res_data.get('chunks', 0)} chunks)!")
@@ -142,9 +143,9 @@ if uploaded_pdf is not None:
             except Exception as e:
                 st.sidebar.error(f"Error processing PDF upload: {e}")
 
-# Fetch real-time storage and index status
+# Fetch real-time storage and index status for this user
 try:
-    status_res = requests.get(STORAGE_STATUS_URL, timeout=5)
+    status_res = requests.get(STORAGE_STATUS_URL, params={"thread_id": st.session_state.thread_id}, timeout=5)
     if status_res.status_code == 200:
         storage_data = status_res.json()
         uploaded_pdfs = storage_data.get("uploaded_pdfs", [])

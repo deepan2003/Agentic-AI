@@ -15,25 +15,21 @@ load_dotenv()
 
 def get_embedding_model():
     """
-    Returns lightweight embeddings:
-    1. Gemini embeddings (free tier, 0 MB RAM) if GEMINI_API_KEY is available.
-    2. HuggingFace as fallback.
+    Returns FastEmbed CPU ONNX quantized embeddings:
+    - Runs in ~30MB RAM.
+    - Zero external API keys, zero rate-limits, zero 404 errors.
+    - Extremely fast execution on Render free tier.
     """
     global _ingest_embeddings
     if "_ingest_embeddings" not in globals() or _ingest_embeddings is None:
-        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if gemini_key:
-            try:
-                from langchain_google_genai import GoogleGenerativeAIEmbeddings
-                print("[Knowledge Engine] Using Google Gemini Cloud Embeddings (0MB RAM)...", flush=True)
-                _ingest_embeddings = GoogleGenerativeAIEmbeddings(
-                    model="models/embedding-001",
-                    google_api_key=gemini_key
-                )
-                return _ingest_embeddings
-            except Exception as e:
-                print(f"[Knowledge Engine Warning] Gemini embeddings initialization error: {e}")
-                
+        try:
+            from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+            print("[Knowledge Engine] Initializing FastEmbed CPU ONNX quantized model (~30MB RAM)...", flush=True)
+            _ingest_embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+            return _ingest_embeddings
+        except Exception as fe_err:
+            print(f"[Knowledge Engine Warning] FastEmbed initialization note: {fe_err}", flush=True)
+
         print("[Knowledge Engine] Using local HuggingFace embeddings...", flush=True)
         _ingest_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return _ingest_embeddings
@@ -47,40 +43,55 @@ cloudinary.config(
 )
 
 CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "agentic-rag-data")
-VECTOR_DB_PATH = "./vector_store/research_papers"
+UPLOAD_BASE_DIR = "./data_uploads"
+VECTOR_BASE_DIR = "./vector_store"
 TMP_DIR = "./tmp_downloads"
-UPLOAD_DIR = "./data_uploads"
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(VECTOR_DB_PATH, exist_ok=True)
+def get_user_upload_dir(thread_id: str = "default") -> str:
+    safe_thread = "".join(c for c in thread_id if c.isalnum() or c in ("-", "_")).strip() or "default"
+    path = os.path.join(UPLOAD_BASE_DIR, safe_thread)
+    os.makedirs(path, exist_ok=True)
+    return path
 
-def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
+def get_user_vector_path(thread_id: str = "default") -> str:
+    safe_thread = "".join(c for c in thread_id if c.isalnum() or c in ("-", "_")).strip() or "default"
+    path = os.path.join(VECTOR_BASE_DIR, safe_thread)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+os.makedirs(UPLOAD_BASE_DIR, exist_ok=True)
+os.makedirs(VECTOR_BASE_DIR, exist_ok=True)
+
+def index_uploaded_pdf(file_bytes: bytes, filename: str, thread_id: str = "default") -> dict:
     """
-    1. Saves uploaded PDF to data_uploads.
-    2. Backs up directly to Cloudinary so it shows in Cloud Storage.
-    3. Extracts chunks and updates FAISS vector index immediately.
+    1. Saves uploaded PDF into the isolated directory for this user thread_id.
+    2. Backs up directly to Cloudinary under the user's specific folder path.
+    3. Extracts chunks and builds/updates the user's private FAISS vector index.
     """
     safe_name = os.path.basename(filename)
-    dest_path = os.path.join(UPLOAD_DIR, safe_name)
+    user_upload_dir = get_user_upload_dir(thread_id)
+    user_vector_path = get_user_vector_path(thread_id)
+    dest_path = os.path.join(user_upload_dir, safe_name)
     with open(dest_path, "wb") as f:
         f.write(file_bytes)
         
-    print(f"[Knowledge Engine] Indexing newly uploaded PDF: {safe_name}...", flush=True)
+    print(f"[Knowledge Engine] Indexing PDF '{safe_name}' for user '{thread_id}'...", flush=True)
 
-    # 1. First: Always back up to Cloudinary
+    # 1. Back up to Cloudinary under user's namespace
+    user_cloud_folder = f"{CLOUDINARY_FOLDER}/{thread_id}"
     try:
         cloudinary.uploader.upload(
             dest_path,
-            folder=CLOUDINARY_FOLDER,
+            folder=user_cloud_folder,
             resource_type="raw",
             public_id=safe_name,
             timeout=15
         )
-        print(f"[Knowledge Engine] Successfully uploaded {safe_name} to Cloudinary folder '{CLOUDINARY_FOLDER}'.", flush=True)
+        print(f"[Knowledge Engine] Successfully backed up {safe_name} to Cloudinary folder '{user_cloud_folder}'.", flush=True)
     except Exception as e:
         print(f"[Knowledge Engine Warning] Cloudinary upload notice: {e}", flush=True)
 
-    # 2. Second: Process text chunks and build FAISS vector index
+    # 2. Process text chunks and build user's private FAISS vector index
     try:
         loader = PyPDFLoader(dest_path)
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -90,19 +101,19 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str) -> dict:
             return {"success": False, "message": "No readable text found in PDF", "chunks": 0}
 
         embeddings = get_embedding_model()
-        index_file = os.path.join(VECTOR_DB_PATH, "index.faiss")
+        index_file = os.path.join(user_vector_path, "index.faiss")
         
         if os.path.exists(index_file):
             try:
-                vector_db = FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization=True)
+                vector_db = FAISS.load_local(user_vector_path, embeddings, allow_dangerous_deserialization=True)
                 vector_db.add_documents(docs)
-                vector_db.save_local(VECTOR_DB_PATH)
+                vector_db.save_local(user_vector_path)
             except Exception:
                 vector_db = FAISS.from_documents(docs, embeddings)
-                vector_db.save_local(VECTOR_DB_PATH)
+                vector_db.save_local(user_vector_path)
         else:
             vector_db = FAISS.from_documents(docs, embeddings)
-            vector_db.save_local(VECTOR_DB_PATH)
+            vector_db.save_local(user_vector_path)
 
         return {
             "success": True,
@@ -129,11 +140,12 @@ def delete_cloudinary_file(public_id: str, resource_type: str = "raw") -> dict:
         print(f"[Cloudinary Error] Failed to delete {public_id}: {e}", flush=True)
         return {"success": False, "error": str(e)}
 
-def delete_uploaded_pdf(filename: str) -> dict:
-    """Deletes a PDF from local data_uploads and tmp_downloads."""
+def delete_uploaded_pdf(filename: str, thread_id: str = "default") -> dict:
+    """Deletes a PDF from user directory and tmp_downloads."""
     safe_name = os.path.basename(filename)
     deleted_any = False
-    for d in [UPLOAD_DIR, TMP_DIR]:
+    dirs_to_check = [get_user_upload_dir(thread_id), TMP_DIR, UPLOAD_BASE_DIR]
+    for d in dirs_to_check:
         path = os.path.join(d, safe_name)
         if os.path.exists(path):
             try:
@@ -143,32 +155,34 @@ def delete_uploaded_pdf(filename: str) -> dict:
                 print(f"Error removing {path}: {e}")
     return {"success": deleted_any}
 
-def list_uploaded_pdfs() -> list:
-    """Lists all PDFs currently saved and indexed in the knowledge base."""
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+def list_uploaded_pdfs(thread_id: str = "default") -> list:
+    """Lists all PDFs currently saved and indexed in the knowledge base for this user."""
+    user_dir = get_user_upload_dir(thread_id)
     files = []
-    for f in os.listdir(UPLOAD_DIR):
-        if f.lower().endswith(".pdf"):
-            full = os.path.join(UPLOAD_DIR, f)
-            files.append({
-                "filename": f,
-                "size_kb": round(os.path.getsize(full) / 1024, 1),
-                "modified": os.path.getmtime(full)
-            })
+    if os.path.exists(user_dir):
+        for f in os.listdir(user_dir):
+            if f.lower().endswith(".pdf"):
+                full = os.path.join(user_dir, f)
+                files.append({
+                    "filename": f,
+                    "size_kb": round(os.path.getsize(full) / 1024, 1),
+                    "modified": os.path.getmtime(full)
+                })
     return sorted(files, key=lambda x: x["modified"], reverse=True)
 
-def list_cloud_storage_files():
+def list_cloud_storage_files(thread_id: str = "default"):
     """
-    Queries Cloudinary and returns a list of files available in the storage folder.
+    Queries Cloudinary and returns a list of files available in this user's storage folder.
     """
     found_files = []
+    folder_prefix = f"{CLOUDINARY_FOLDER}/{thread_id}/"
     
-    # 1. Check raw resources
+    # 1. Check raw resources in user's folder
     try:
         res_raw = cloudinary.api.resources(
             type="upload",
             resource_type="raw",
-            prefix=CLOUDINARY_FOLDER + "/",
+            prefix=folder_prefix,
             max_results=500
         )
         for r in res_raw.get("resources", []):
@@ -185,12 +199,12 @@ def list_cloud_storage_files():
     except Exception as e:
         print(f"[Cloudinary Warning] Error checking raw resources: {e}")
 
-    # 2. Check image resources
+    # 2. Check image resources in user's folder
     try:
         res_img = cloudinary.api.resources(
             type="upload",
             resource_type="image",
-            prefix=CLOUDINARY_FOLDER + "/",
+            prefix=folder_prefix,
             max_results=500
         )
         for r in res_img.get("resources", []):
@@ -209,6 +223,8 @@ def list_cloud_storage_files():
                 })
     except Exception as e:
         print(f"[Cloudinary Warning] Error checking image resources: {e}")
+        
+    return found_files
         
     return found_files
 

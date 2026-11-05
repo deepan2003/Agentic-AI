@@ -22,7 +22,7 @@ def health_check():
 
 @app.route("/api/upload_pdf", methods=["POST"])
 def upload_pdf_endpoint():
-    """Receives an uploaded PDF file, indexes it into FAISS, and backs it up."""
+    """Receives an uploaded PDF file, indexes it into user FAISS index, and backs it up."""
     if "file" not in request.files:
         return jsonify({"success": False, "message": "No file uploaded in request."}), 400
         
@@ -34,10 +34,11 @@ def upload_pdf_endpoint():
     if not filename.lower().endswith(".pdf"):
         return jsonify({"success": False, "message": "Only PDF files are supported."}), 400
 
+    thread_id = request.form.get("thread_id", "default").strip() or "default"
     file_bytes = uploaded_file.read()
-    print(f"\n====== 📄 PDF UPLOAD RECEIVED: {filename} ({len(file_bytes)} bytes) ======", flush=True)
+    print(f"\n====== 📄 PDF UPLOAD RECEIVED: {filename} ({len(file_bytes)} bytes) FOR USER '{thread_id}' ======", flush=True)
 
-    result = index_uploaded_pdf(file_bytes, filename)
+    result = index_uploaded_pdf(file_bytes, filename, thread_id=thread_id)
     status_code = 200 if result.get("success") else 500
     return jsonify(result), status_code
 
@@ -48,27 +49,30 @@ def delete_cloud_file_endpoint():
     public_id = data.get("public_id")
     filename = data.get("filename", "")
     resource_type = data.get("resource_type", "raw")
+    thread_id = data.get("thread_id", "default")
     
     if not public_id and not filename:
         return jsonify({"success": False, "message": "Missing public_id or filename"}), 400
         
-    print(f"\n====== 🗑️ DELETE REQUEST: {public_id or filename} ======", flush=True)
+    print(f"\n====== 🗑️ DELETE REQUEST: {public_id or filename} FOR USER '{thread_id}' ======", flush=True)
     res = {}
     if public_id:
         res = delete_cloudinary_file(public_id, resource_type=resource_type)
     if filename:
-        delete_uploaded_pdf(filename)
+        delete_uploaded_pdf(filename, thread_id=thread_id)
         
     return jsonify({"success": True, "result": res}), 200
 
 @app.route("/api/storage_status", methods=["GET"])
 def storage_status_endpoint():
-    """Returns actual files present in Cloudinary and the local FAISS index status."""
+    """Returns actual files present in Cloudinary and the local FAISS index status for this user."""
+    thread_id = request.args.get("thread_id", "default").strip() or "default"
     try:
-        cloud_files = list_cloud_storage_files()
-        uploaded_pdfs = list_uploaded_pdfs()
-        vector_db_path = "./vector_store/research_papers"
-        has_index = os.path.exists(vector_db_path) and os.path.exists(os.path.join(vector_db_path, "index.faiss"))
+        cloud_files = list_cloud_storage_files(thread_id=thread_id)
+        uploaded_pdfs = list_uploaded_pdfs(thread_id=thread_id)
+        from ingestion import get_user_vector_path
+        user_vector_path = get_user_vector_path(thread_id)
+        has_index = os.path.exists(user_vector_path) and os.path.exists(os.path.join(user_vector_path, "index.faiss"))
         
         return jsonify({
             "success": True,

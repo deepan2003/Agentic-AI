@@ -40,9 +40,12 @@ def invoke_orchestrator_llm(system_instruction: str, history_messages: list):
     )
 
 # 3. Define the Core Manager Logic Node
-def main_orchestrator_node(state: AgentState):
+def main_orchestrator_node(state: AgentState, config: dict = None):
     # Get the latest message the user sent
     last_user_message = state["messages"][-1].content
+    thread_id = "default"
+    if config and "configurable" in config:
+        thread_id = config["configurable"].get("thread_id", "default")
     
     # Load global rules
     rules = ""
@@ -159,8 +162,8 @@ def main_orchestrator_node(state: AgentState):
     else:
         print("[Main Agent] Intent identified: Fact/Tool Dependent. Activating Research Sub-Agent...")
         
-        # Delegate factual exploration to your sub-agent
-        fact_sheet = hybrid_research_worker(last_user_message)
+        # Delegate factual exploration to your sub-agent with user's isolated context
+        fact_sheet = hybrid_research_worker(last_user_message, thread_id=thread_id)
         
         # If user asked to save research findings to a file, ensure it is written to disk!
         if any(w in last_user_message.lower() for w in ["save", "create a file", "write to file", ".txt", ".md", ".doc", ".docx"]):
