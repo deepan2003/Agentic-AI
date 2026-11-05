@@ -1,268 +1,179 @@
 import os
 import re
 import json
+import time
 from typing import List
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_tavily import TavilySearch
-from langgraph.prebuilt import create_react_agent
-from langchain_core.prompts import PromptTemplate
-from tools.file_system import save_file_to_disk
-from tools.code_executor import execute_python_code
+from llm_gateway import smart_gateway
 from tools.research import query_local_research_papers
 from tools.web_search import custom_web_search, custom_web_fetch
+from tools.file_system import save_file_to_disk
 
 load_dotenv()
 
-# Define the strict output format the Sub-Agent must use
 class FactSheet(BaseModel):
-    summary: str = Field(description="A concise summary of the core answer found.")
-    verified_facts: List[str] = Field(description="List of hard factual points extracted from sources.")
-    sources_used: List[str] = Field(description="List of document names or URLs actually utilized.")
+    summary: str = Field(description="Comprehensive summary of the findings answering the user's query.")
+    verified_facts: List[str] = Field(description="List of specific, verified factual statements extracted from the source context.")
+    sources_used: List[str] = Field(description="List of source filenames or URLs used.")
 
-def parse_fact_sheet(raw_content: str, combined_context: str) -> FactSheet:
+
+def _is_document_or_resume_query(query: str) -> bool:
+    """Returns True if the user is asking about an uploaded PDF, resume, CV, or candidate profile."""
+    q = query.lower()
+    doc_keywords = [
+        "resume", "cv", "curriculum vitae", "deepan", "uploaded", "pdf",
+        "paper", "candidate", "his skills", "his experience", "his projects",
+        "his education", "according to his", "accoridng to his", "in the document"
+    ]
+    return any(k in q for k in doc_keywords)
+
+
+def _extract_factsheet_from_context(user_query: str, raw_context: str, sources: List[str]) -> FactSheet:
     """
-    Safely parses the FactSheet JSON output from the LLM, avoiding fragile
-    tool-call JSON parsing errors on Groq.
+    Compiles raw context into a verified FactSheet in a SINGLE fast LLM call via smart_gateway
+    (avoids slow multi-turn tool loops and 60s structured_output stalls).
     """
-    # 1. Attempt regex extraction of the JSON object
-    match = re.search(r'\{[\s\S]*\}', raw_content)
-    if match:
-        json_candidate = match.group(0)
-        try:
-            data = json.loads(json_candidate)
-            summary = str(data.get("summary", "")).strip() or "Summary of gathered research."
-            raw_facts = data.get("verified_facts", [])
-            if not isinstance(raw_facts, list):
-                raw_facts = [str(raw_facts)]
-            raw_sources = data.get("sources_used", [])
-            if not isinstance(raw_sources, list):
-                raw_sources = [str(raw_sources)]
-                
-            clean_facts = [str(f).strip() for f in raw_facts if str(f).strip()]
-            clean_sources = [str(s).strip() for s in raw_sources if str(s).strip()]
-            
-            if clean_facts:
-                return FactSheet(
-                    summary=summary,
-                    verified_facts=clean_facts,
-                    sources_used=clean_sources
-                )
-        except Exception:
-            pass
-
-    # 2. Resilient fallback parsing: extract bullet points or sentences
-    lines = []
-    for line in raw_content.splitlines():
-        cleaned = line.strip().lstrip("-*•0123456789. ")
-        if len(cleaned) > 12 and not cleaned.startswith("{") and not cleaned.startswith("}"):
-            lines.append(cleaned)
-            
-    summary = lines[0] if lines else "Research findings from retrieved context."
-    facts = lines[:15] if lines else ["Verified factual data retrieved from live research."]
-    
-    return FactSheet(
-        summary=summary,
-        verified_facts=facts,
-        sources_used=[]
-    )
-
-def hybrid_research_worker(query: str, thread_id: str = "default") -> FactSheet:
-    print(f"\n[Sub-Agent] Starting research for: '{query}' (User: '{thread_id}')", flush=True)
-    
-    # 1. Initialize Groq LLM early for internal evaluations
-    llm = ChatOpenAI(
-        base_url="https://api.groq.com/openai/v1",
-        model="openai/gpt-oss-120b",
-        api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0.0
-    )
-    
-    # ====================================================================
-    # 2. 📚 STEP 1: ALWAYS SEARCH LOCAL RAG FIRST
-    # ====================================================================
-    print(f"[Sub-Agent] Checking user '{thread_id}' RAG database first...", flush=True)
-    query_lower = query.lower()
-    is_doc_query = any(ind in query_lower for ind in [
-        "resume", "cv", "pdf", "paper", "document", "uploaded", "rag", "system", 
-        "profile", "candidate", "deepan", "experience", "education", "skill", "who is", "role", "fit"
-    ])
-
-    local_data = query_local_research_papers(query, top_k=5, thread_id=thread_id)
-
-    # If document query and local data is still empty, auto-build from Cloudinary/uploads immediately
-    if is_doc_query and not local_data:
-        print(f"[Sub-Agent] Document query detected with empty index. Running auto-build for '{thread_id}'...", flush=True)
-        from ingestion import build_local_vector_db
-        build_local_vector_db(thread_id=thread_id)
-        local_data = query_local_research_papers(query, top_k=5, thread_id=thread_id)
-    
-    # If user asks for general document overview, expand search with profile keywords
-    if is_doc_query and len(local_data) < 3:
-        broad_data = query_local_research_papers("Deepan AI Engineer Computer Vision GenAI experience skills education projects", top_k=5, thread_id=thread_id)
-        seen_snippets = {d.get("content_snippet", "") for d in local_data}
-        for bd in broad_data:
-            if bd.get("content_snippet", "") not in seen_snippets and "error" not in bd:
-                local_data.append(bd)
-                seen_snippets.add(bd.get("content_snippet", ""))
-
-    local_text_snippet = ""
-    for doc in local_data:
-        if "error" not in doc:
-            local_text_snippet += f"{doc.get('content_snippet', '')}\n"
-
-    # Smart Relevancy Check: Does the local PDF answer or relate to the query?
-    is_local_relevant = False
-    if local_text_snippet.strip():
-        if is_doc_query:
-            # User specifically asked about the document / resume / RAG
-            is_local_relevant = True
-        else:
-            relevancy_prompt = (
-                f"User Question: {query}\n"
-                f"Local Document Snippets:\n{local_text_snippet[:2000]}\n\n"
-                f"Does the Local Document contain information related to or answering the user's question? "
-                f"Answer 'YES' if it relates or can answer; answer 'NO' ONLY if completely unrelated. Answer ONLY 'YES' or 'NO'."
-            )
-            try:
-                check_response = llm.invoke(relevancy_prompt).content.strip().upper()
-                if "YES" in check_response:
-                    is_local_relevant = True
-            except Exception:
-                is_local_relevant = True
-
-    # Containers for search findings
-    web_data = []
-    combined_context = ""
-
-    # ====================================================================
-    # 3. 🌐 STEP 2: RAG MATCH vs LIVE TAVILY SEARCH FALLBACK
-    # ====================================================================
-    if is_local_relevant:
-        print("[Sub-Agent] ✅ RAG Match: Context found in uploaded PDF(s). Bypassing live web crawling.", flush=True)
-        combined_context += "--- LOCAL KNOWLEDGE BASE (PDF) EXTRACTS ---\n"
-        for doc in local_data:
-            if "error" not in doc:
-                combined_context += f"Source: {doc.get('source_file', 'Uploaded PDF')}\nContent: {doc.get('content_snippet', '')}\n\n"
-    elif is_doc_query:
-        # STRICT RULE: NEVER search the public web for a private user's resume or CV!
-        print("[Sub-Agent] 🛡️ Resume/Document query with no indexed text. Banning live web search to prevent public confusion.", flush=True)
-        combined_context += (
-            "--- LOCAL KNOWLEDGE BASE (PDF) ---\n"
-            "The requested information is regarding the user's private uploaded document/resume. "
-            "However, the document index is currently empty. Please ensure the PDF is indexed via 'Sync Cloud Assets to RAG System'. "
-            "Do NOT fabricate information or search the public web for other people.\n\n"
-        )
-    else:
-        print("[Sub-Agent] 🌐 Non-document query with no local RAG match. Falling back to Tavily live web search...", flush=True)
-        web_links = custom_web_search(query, max_results=1)
-        for link in web_links:
-            if "url" in link:
-                content = custom_web_fetch(link["url"])
-                web_data.append(content)
-
-        combined_context += "--- LIVE WEB EXTRACTS ---\n"
-        for page in web_data:
-            combined_context += f"Source: {page['url']}\nContent: {page['content']}\n\n"
-
-        from datetime import datetime
-        current_year = datetime.now().year
-        optimizer_prompt = f"""
-        You are an expert search query generator. CURRENT SYSTEM YEAR: {current_year}.
-        Convert the user's conversational question into a strict, highly targeted search engine keyword string.
-        User Question: {query}
-        """
-        try:
-            optimized_query = llm.invoke(optimizer_prompt).content.strip()
-            tavily_search = TavilySearch(max_results=1, search_depth="basic", include_raw_content=False)
-            tavily_data = tavily_search.invoke({"query": optimized_query})
-            combined_context += f"--- TAVILY LIVE NEWS ---\n{tavily_data}\n\n"
-        except Exception as e:
-            print(f"[Sub-Agent Warning] Tavily search error: {e}", flush=True)
-
-    # ====================================================================
-    # 4. 💻 STEP 3: CODING TASK PRIORITY (CHECK RAG FIRST -> RUN CODE TOOL)
-    # ====================================================================
-    is_coding_task = any(kw in query_lower for kw in ["code", "python", "script", "function", "algorithm", "calculate", "math", "run "])
-    if is_coding_task:
-        has_code_in_rag = is_local_relevant and any(marker in local_text_snippet.lower() for marker in [
-            "def ", "class ", "import ", "return ", "for ", "while ", "function", "lambda", "const "
-        ])
-        user_wants_execution = any(act in query_lower for act in ["execute", "run ", "test the code", "calculate", "compute", "solve"])
-
-        if has_code_in_rag and not user_wants_execution:
-            print("[Sub-Agent] Code found in local PDF RAG context. Using document code.", flush=True)
-        else:
-            print("[Sub-Agent] Code not in PDF or execution requested. Running Python sandbox tool...", flush=True)
-            tool_agent = create_react_agent(llm, tools=[execute_python_code, save_file_to_disk])
-            tool_instructions = (
-                f"You are a coding and execution agent.\n"
-                f"- If math calculation, code generation, or execution is needed, run it using 'execute_python_code'.\n"
-                f"- If the user asks to save/create a file, use 'save_file_to_disk'.\n"
-                f"CONTEXT:\n{combined_context}\n\n"
-                f"User Query: {query}"
-            )
-            try:
-                tool_results = tool_agent.invoke(
-                    {"messages": [("user", tool_instructions)]},
-                    config={"recursion_limit": 5}
-                )
-                final_tool_answer = tool_results["messages"][-1].content
-                combined_context += f"--- PYTHON CODE EXECUTION RESULTS ---\n{final_tool_answer}\n\n"
-            except Exception as te:
-                print(f"[Sub-Agent Warning] Tool execution note: {te}", flush=True)
-
-    # File save tool trigger if requested and not yet run
-    if any(kw in query_lower for kw in ["save", "write to", "create a file", "export"]) and "save_file_to_disk" not in combined_context:
-        print("[Sub-Agent] File creation requested. Invoking save_file_to_disk tool...", flush=True)
-        tool_agent = create_react_agent(llm, tools=[save_file_to_disk])
-        try:
-            tool_results = tool_agent.invoke(
-                {"messages": [("user", f"Save the required content using save_file_to_disk.\nContext: {combined_context}\nQuery: {query}")]},
-                config={"recursion_limit": 3}
-            )
-            combined_context += f"--- FILE SAVE RESULT ---\n{tool_results['messages'][-1].content}\n\n"
-        except Exception as fe:
-            print(f"[Sub-Agent Warning] File save note: {fe}", flush=True)
-
-    # ====================================================================
-    # 5. 📋 STEP 4: FINAL OUTPUT STRUCTURING (FACT SHEET)
-    # ====================================================================
-    system_prompt = (
-        "You are an elite research assistant. Analyze the provided context extracts thoroughly.\n\n"
-        "Generate a strictly formatted JSON object matching this structure:\n"
-        "{\n"
-        '  "summary": "A concise summary of the core answer found.",\n'
-        '  "verified_facts": [\n'
-        '    "Detailed factual headline or extract point 1",\n'
-        '    "Detailed factual headline or extract point 2"\n'
-        '  ],\n'
-        '  "sources_used": ["source 1", "source 2"]\n'
-        "}\n\n"
-        "CRITICAL RULES:\n"
-        "1. List EVERY SINGLE factual finding, skill, project, experience, or headline as an individual string in 'verified_facts'.\n"
-        "2. Keep the JSON 100% syntactically valid. Escape internal quotes with \\\". Do not include markdown code fences.\n"
-        "3. Output ONLY the JSON object and nothing else."
-    )
-
+    t0 = time.time()
     print("[Sub-Agent] Compiling facts into structured schema...", flush=True)
-    response = llm.invoke([
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Context:\n{combined_context}\n\nQuery: {query}"}
-    ])
-    
-    fact_sheet_object = parse_fact_sheet(response.content, combined_context)
-    
-    # Ensure source documents are listed
-    if is_local_relevant:
-        for doc in local_data:
-            sf = doc.get("source_file", "")
-            if sf and sf != "Unknown":
-                base_sf = os.path.basename(sf)
-                if base_sf not in fact_sheet_object.sources_used:
-                    fact_sheet_object.sources_used.append(base_sf)
 
-    print(f"[Sub-Agent] Research complete. Extracted {len(fact_sheet_object.verified_facts)} verified facts.", flush=True)
-    return fact_sheet_object
+    prompt = (
+        "You are a precise research extraction engine.\n"
+        "Extract the relevant facts from the SOURCE CONTEXT below to answer the USER QUERY.\n"
+        "Respond ONLY with a valid JSON object matching this exact schema (no markdown fences, no extra text):\n"
+        '{\n'
+        '  "summary": "Direct, clear summary answering the user query based strictly on the context",\n'
+        '  "verified_facts": ["Fact 1", "Fact 2", "Fact 3", "Fact 4"],\n'
+        '  "sources_used": ["Source 1"]\n'
+        '}\n\n'
+        f"USER QUERY: {user_query}\n\n"
+        f"AVAILABLE SOURCES: {', '.join(sources) if sources else 'Local Knowledge Base'}\n\n"
+        f"SOURCE CONTEXT:\n{raw_context[:6000]}"
+    )
+
+    try:
+        res = smart_gateway.completion(messages=[{"role": "user", "content": prompt}])
+        text = res.content.strip()
+        # Strip markdown json fences if present
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text).strip()
+
+        start_idx = text.find("{")
+        end_idx = text.rfind("}")
+        if start_idx != -1 and end_idx != -1:
+            data = json.loads(text[start_idx:end_idx + 1])
+            summary = str(data.get("summary") or "").strip()
+            facts = [str(f).strip() for f in data.get("verified_facts", []) if str(f).strip()]
+            used_sources = [str(s).strip() for s in data.get("sources_used", []) if str(s).strip()] or sources
+            if summary or facts:
+                print(f"[Sub-Agent] ✅ Compiled {len(facts)} verified facts in {time.time() - t0:.2f}s.", flush=True)
+                return FactSheet(
+                    summary=summary or " ".join(facts[:3]),
+                    verified_facts=facts if facts else [summary],
+                    sources_used=used_sources
+                )
+    except Exception as e:
+        print(f"[Sub-Agent Warning] Fast JSON parse fallback ({e}). Using direct text extraction.", flush=True)
+
+    # Instant deterministic fallback so the sub-agent NEVER hangs or crashes
+    snippets = [line.strip() for line in raw_context.splitlines() if len(line.strip()) > 25][:6]
+    if not snippets:
+        snippets = [raw_context[:500].strip()] if raw_context.strip() else ["No relevant data found."]
+    return FactSheet(
+        summary=snippets[0],
+        verified_facts=snippets,
+        sources_used=sources or ["Knowledge Base"]
+    )
+
+
+def hybrid_research_worker(user_query: str, thread_id: str = "default") -> FactSheet:
+    """
+    Fast Hybrid Research Sub-Agent:
+    1. Immediately searches user's local FAISS RAG database (<10ms).
+    2. If relevant PDF chunks exist, extracts FactSheet in 1 fast LLM call (~1.5s).
+    3. If query requires live web data (and is not a private resume query), searches Tavily.
+    """
+    t_start = time.time()
+    print(f"\n[Sub-Agent] Starting research for: '{user_query}' (User: '{thread_id}')", flush=True)
+    print(f"[Sub-Agent] Checking user '{thread_id}' RAG database first...", flush=True)
+
+    local_results = query_local_research_papers(user_query, top_k=5, thread_id=thread_id)
+    valid_chunks = [r for r in local_results if isinstance(r, dict) and "content_snippet" in r and r.get("content_snippet", "").strip()]
+
+    is_doc_query = _is_document_or_resume_query(user_query)
+
+    if valid_chunks:
+        combined_pdf_text = "\n\n".join(
+            f"[Source: {r.get('source_file', 'Uploaded PDF')}]\n{r['content_snippet']}"
+            for r in valid_chunks
+        )
+        pdf_sources = list(dict.fromkeys(r.get("source_file", "Uploaded PDF") for r in valid_chunks))
+
+        # If user is explicitly asking about the resume/PDF, immediately use the PDF chunks!
+        if is_doc_query:
+            print("[Sub-Agent] ✅ RAG Match: Resume/Document query matched uploaded PDF(s). Bypassing live web crawling.", flush=True)
+            sheet = _extract_factsheet_from_context(user_query, combined_pdf_text, pdf_sources)
+            print(f"[Sub-Agent] 🏁 Research complete in {time.time() - t_start:.2f}s. Extracted {len(sheet.verified_facts)} facts.", flush=True)
+            return sheet
+
+        # Otherwise do a quick relevance check in <1s
+        gate_prompt = (
+            "Does the following PDF excerpt contain information that answers the user's question?\n"
+            "Reply with ONLY 'YES' or 'NO'.\n\n"
+            f"Question: {user_query}\n\n"
+            f"PDF Excerpt:\n{combined_pdf_text[:2500]}"
+        )
+        try:
+            gate_res = smart_gateway.completion(messages=[{"role": "user", "content": gate_prompt}])
+            if "YES" in gate_res.content.strip().upper():
+                print("[Sub-Agent] ✅ RAG Match: Context found in uploaded PDF(s). Bypassing live web crawling.", flush=True)
+                sheet = _extract_factsheet_from_context(user_query, combined_pdf_text, pdf_sources)
+                print(f"[Sub-Agent] 🏁 Research complete in {time.time() - t_start:.2f}s. Extracted {len(sheet.verified_facts)} facts.", flush=True)
+                return sheet
+        except Exception as e:
+            print(f"[Sub-Agent Warning] Gate check error: {e}", flush=True)
+
+    # If the user asked about a resume/document and no PDF chunks were found, do not leak/confuse with public web search
+    if is_doc_query and not valid_chunks:
+        print("[Sub-Agent] 🛡️ Resume/Document query with no indexed text. Skipping web search.", flush=True)
+        return FactSheet(
+            summary="No uploaded PDF or resume was found in the knowledge base for this user session. Please upload the PDF in the left sidebar or click 'Sync Cloud Assets'.",
+            verified_facts=["No indexed PDF chunks were found in the local vector store for this session."],
+            sources_used=["Local RAG Database"]
+        )
+
+    # Stage 4: Live Web Search via Tavily
+    print(f"[Sub-Agent] 🌐 Querying live web search (Tavily) for: '{user_query}'...", flush=True)
+    search_results = custom_web_search(user_query, max_results=3)
+    valid_urls = [r for r in search_results if isinstance(r, dict) and "url" in r]
+
+    web_contexts = []
+    sources_used = []
+    for item in valid_urls[:2]:
+        url = item["url"]
+        title = item.get("title", url)
+        print(f"[Sub-Agent] 📄 Fetching web content from: {url}", flush=True)
+        fetched = custom_web_fetch(url)
+        content = fetched.get("content", "")
+        if content and not content.startswith("Error:") and not content.startswith("Failed"):
+            web_contexts.append(f"[Title: {title} | URL: {url}]\n{content[:2500]}")
+            sources_used.append(url)
+
+    if web_contexts:
+        combined_web = "\n\n".join(web_contexts)
+        sheet = _extract_factsheet_from_context(user_query, combined_web, sources_used)
+        print(f"[Sub-Agent] 🏁 Web research complete in {time.time() - t_start:.2f}s. Extracted {len(sheet.verified_facts)} facts.", flush=True)
+        return sheet
+
+    # Final fallback: answer using general model knowledge if web search returned nothing
+    print("[Sub-Agent] ⚠️ No external web pages fetched; synthesizing from model knowledge...", flush=True)
+    fallback_res = smart_gateway.completion(
+        messages=[{"role": "user", "content": f"Provide a concise, factual answer to: {user_query}"}]
+    )
+    answer_text = fallback_res.content.strip()
+    lines = [l.strip("- *•") for l in answer_text.splitlines() if len(l.strip()) > 15][:5]
+    return FactSheet(
+        summary=answer_text,
+        verified_facts=lines or [answer_text],
+        sources_used=["AI Knowledge Base"]
+    )

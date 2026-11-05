@@ -4,9 +4,7 @@ from langchain_community.vectorstores import FAISS
 VECTOR_DB_PATH = "./vector_store/research_papers"
 
 def get_embeddings():
-    """
-    Returns unified FastEmbed CPU ONNX quantized model (~30MB RAM, zero PyTorch, 100% reliable).
-    """
+    """Returns the unified fast embedding model from ingestion.py."""
     from ingestion import get_embedding_model
     return get_embedding_model()
 
@@ -23,7 +21,7 @@ def query_local_research_papers(query_str: str, top_k: int = 5, thread_id: str =
     if not os.path.exists(index_file):
         has_files = list_uploaded_pdfs(thread_id=thread_id) or list_cloud_storage_files(thread_id=thread_id)
         if has_files:
-            print(f"[RAG Engine] Index missing but files found for '{thread_id}'. Auto-building vector store...", flush=True)
+            print(f"[RAG Engine] Index missing for '{thread_id}'. Building vector store now...", flush=True)
             build_local_vector_db(thread_id=thread_id)
 
     # Check fallback to default vector path if user index is empty
@@ -45,12 +43,27 @@ def query_local_research_papers(query_str: str, top_k: int = 5, thread_id: str =
         results = []
         for doc, score in docs:
             results.append({
-                "source_file": doc.metadata.get("source", "Uploaded PDF"),
+                "source_file": os.path.basename(doc.metadata.get("source", "Uploaded PDF")),
                 "content_snippet": doc.page_content,
                 "relevance_score": float(score)
             })
         print(f"[RAG Engine] Successfully retrieved {len(results)} chunks for query '{query_str}'", flush=True)
         return results
     except Exception as e:
-        print(f"[RAG Engine Error] Search failed: {e}", flush=True)
-        return [{"error": f"Failed to search user database: {str(e)}"}]
+        print(f"[RAG Engine Warning] Rebuilding index for '{thread_id}' due to load notice: {e}", flush=True)
+        try:
+            build_local_vector_db(thread_id=thread_id, force_sync=False)
+            embeddings = get_embeddings()
+            vector_db = FAISS.load_local(user_vector_path, embeddings, allow_dangerous_deserialization=True)
+            docs = vector_db.similarity_search_with_score(query_str, k=top_k)
+            return [
+                {
+                    "source_file": os.path.basename(doc.metadata.get("source", "Uploaded PDF")),
+                    "content_snippet": doc.page_content,
+                    "relevance_score": float(score)
+                }
+                for doc, score in docs
+            ]
+        except Exception as e2:
+            print(f"[RAG Engine Error] Search failed: {e2}", flush=True)
+            return []

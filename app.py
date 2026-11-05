@@ -1,8 +1,10 @@
 import os
 import io
 import sys
+import time
 import threading
 import contextlib
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -19,21 +21,42 @@ from ingestion import (
 
 load_dotenv()
 
-# Dual stdout writer that outputs to server console immediately while also buffering for frontend
+# Live per-user log store so Streamlit can display real-time backend progress while a query is running
+LIVE_LOGS = {}
+LIVE_LOGS_LOCK = threading.Lock()
+
+def append_live_log(thread_id: str, line: str):
+    clean = line.strip()
+    if not clean:
+        return
+    ts = datetime.now().strftime("%H:%M:%S")
+    entry = f"[{ts}] {clean}"
+    with LIVE_LOGS_LOCK:
+        LIVE_LOGS.setdefault(thread_id, []).append(entry)
+
+# Dual stdout writer that outputs to Render console immediately AND streams to LIVE_LOGS for frontend polling
 class DualStream(io.StringIO):
+    def __init__(self, thread_id: str = "default"):
+        super().__init__()
+        self.thread_id = thread_id
+        self._buf = ""
+
     def write(self, s):
         sys.__stdout__.write(s)
         sys.__stdout__.flush()
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                append_live_log(self.thread_id, line.strip())
         return super().write(s)
 
-# Pre-warm FastEmbed embeddings in background on startup so first user query has ZERO lag
+# Pre-warm embeddings on startup
 def _bg_prewarm():
     try:
-        print("[Startup] ⚡ Pre-warming FastEmbed embeddings in background...", flush=True)
         get_embedding_model()
-        print("[Startup] ✅ FastEmbed embeddings loaded and ready for immediate queries!", flush=True)
     except Exception as e:
-        print(f"[Startup Warning] Background pre-warm notice: {e}", flush=True)
+        print(f"[Startup Warning] Pre-warm notice: {e}", flush=True)
 
 threading.Thread(target=_bg_prewarm, daemon=True).start()
 
@@ -48,6 +71,14 @@ CORS(app)
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok", "service": "Agentic RAG Backend"}), 200
+
+@app.route("/api/live_logs", methods=["GET"])
+def live_logs_endpoint():
+    """Returns real-time backend execution logs for the currently running request."""
+    thread_id = (request.args.get("thread_id") or "default").strip() or "default"
+    with LIVE_LOGS_LOCK:
+        logs = list(LIVE_LOGS.get(thread_id, []))
+    return jsonify({"success": True, "thread_id": thread_id, "logs": logs}), 200
 
 @app.route("/api/upload_pdf", methods=["POST"])
 def upload_pdf_endpoint():
@@ -102,11 +133,6 @@ def storage_status_endpoint():
         user_vector_path = get_user_vector_path(thread_id)
         has_index = os.path.exists(user_vector_path) and os.path.exists(os.path.join(user_vector_path, "index.faiss"))
         
-        # Self-healing in background thread so /api/storage_status never blocks the UI!
-        if not has_index and (cloud_files or uploaded_pdfs):
-            print(f"[Storage Status] Missing index detected for '{thread_id}'. Triggering background auto-build...", flush=True)
-            threading.Thread(target=build_local_vector_db, kwargs={"thread_id": thread_id}, daemon=True).start()
-        
         return jsonify({
             "success": True,
             "cloud_files": cloud_files,
@@ -134,7 +160,7 @@ def update_knowledge_endpoint():
     thread_id = thread_id.strip() or "default"
     print(f"[Knowledge Engine] Syncing cloud assets for user: '{thread_id}'...", flush=True)
     
-    captured_stdout = io.StringIO()
+    captured_stdout = DualStream(thread_id=thread_id)
     try:
         with contextlib.redirect_stdout(captured_stdout):
             print("⏳ [Pipeline] Checking storage and vector index...", flush=True)
@@ -164,6 +190,7 @@ def update_knowledge_endpoint():
 
 @app.route("/api/chat", methods=["POST"])
 def chat_endpoint():
+    t_req_start = time.time()
     print("\n====== 🟢 NEW REQUEST RECEIVED ======", flush=True)
     data = request.json or {}
     user_query = data.get("message", "").strip()
@@ -174,12 +201,15 @@ def chat_endpoint():
     if not user_query:
         return jsonify({"response": "Empty prompt received.", "logs": []}), 400
 
+    with LIVE_LOGS_LOCK:
+        LIVE_LOGS[thread_id] = []
+
     smart_gateway.execution_logs = []
-    captured_stdout = DualStream()
+    captured_stdout = DualStream(thread_id=thread_id)
 
     try:
         with contextlib.redirect_stdout(captured_stdout):
-            print("⏳ [Gateway] Scanning user input for malicious intent...", flush=True)
+            print(f"⏳ [Gateway] Scanning user input for malicious intent (User: '{thread_id}')...", flush=True)
             secure_prompt = verify_user_input(user_query)
             
             if secure_prompt == "SECURITY_BLOCK":
@@ -197,15 +227,14 @@ def chat_endpoint():
             )
             
             final_response = state_output["messages"][-1].content
-            print("✅ [System] Gateway approval verified successfully.", flush=True)
+            total_s = time.time() - t_req_start
+            print(f"✅ [System] Request completed in {total_s:.2f}s.", flush=True)
 
-        printed_logs = [line.strip() for line in captured_stdout.getvalue().splitlines() if line.strip()]
-        combined_logs = printed_logs + smart_gateway.execution_logs
+        with LIVE_LOGS_LOCK:
+            timestamped_logs = list(LIVE_LOGS.get(thread_id, []))
+        combined_logs = timestamped_logs + smart_gateway.execution_logs
 
-        for plog in combined_logs:
-            print(f"[Render Live Log] {plog}", flush=True)
-
-        print("✅ 4. Success! Sending answer back to frontend.", flush=True)
+        print(f"✅ 4. Success! Sending answer back to frontend ({len(combined_logs)} log lines).", flush=True)
         return jsonify({
             "response": final_response, 
             "logs": combined_logs
@@ -213,10 +242,13 @@ def chat_endpoint():
 
     except Exception as e:
         err_msg = str(e)
+        append_live_log(thread_id, f"❌ [CRITICAL SERVER ERROR] {err_msg}")
         print(f"❌ CRITICAL SERVER ERROR: {err_msg}", flush=True)
+        with LIVE_LOGS_LOCK:
+            timestamped_logs = list(LIVE_LOGS.get(thread_id, []))
         return jsonify({
             "response": f"An execution error occurred inside the agent engine: {err_msg}",
-            "logs": smart_gateway.execution_logs + [f"[CRITICAL] {err_msg}"]
+            "logs": timestamped_logs + smart_gateway.execution_logs + [f"[CRITICAL] {err_msg}"]
         }), 500
 
 if __name__ == "__main__":

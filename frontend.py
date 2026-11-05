@@ -3,6 +3,7 @@ import requests
 import os
 import re
 import time
+import threading
 from datetime import datetime
 import uuid
 
@@ -13,6 +14,7 @@ st.caption("Powered by Smart LLM Routing Engine & Cross-Provider Fallbacks")
 # Detect backend URL from environment (for Render deployment) or fallback to localhost
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5060")
 FLASK_API_URL = f"{BACKEND_URL}/api/chat"
+LIVE_LOGS_URL = f"{BACKEND_URL}/api/live_logs"
 UPDATE_API_URL = f"{BACKEND_URL}/api/update_knowledge"
 STORAGE_STATUS_URL = f"{BACKEND_URL}/api/storage_status"
 UPLOAD_PDF_URL = f"{BACKEND_URL}/api/upload_pdf"
@@ -121,11 +123,11 @@ uploaded_pdf = st.sidebar.file_uploader(
 
 if uploaded_pdf is not None:
     if "last_indexed_pdf" not in st.session_state or st.session_state.last_indexed_pdf != uploaded_pdf.name:
-        with st.sidebar.status(f"⚙️ Indexing '{uploaded_pdf.name}' into RAG..."):
+        with st.sidebar.status(f"⚙️ Indexing '{uploaded_pdf.name}' into RAG...", expanded=True):
             try:
                 files = {"file": (uploaded_pdf.name, uploaded_pdf.getvalue(), "application/pdf")}
                 data = {"thread_id": st.session_state.thread_id}
-                up_res = requests.post(UPLOAD_PDF_URL, files=files, data=data, timeout=120)
+                up_res = requests.post(UPLOAD_PDF_URL, files=files, data=data, timeout=60)
                 if up_res.status_code == 200:
                     res_data = up_res.json()
                     st.sidebar.success(f"✅ Indexed '{uploaded_pdf.name}' ({res_data.get('chunks', 0)} chunks)!")
@@ -186,10 +188,10 @@ except Exception:
 if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
     pipeline_container = st.empty()
     
-    with pipeline_container.status("🛸 Connecting to storage...", expanded=True) as pipe_status:
+    with pipeline_container.status("🛸 Syncing cloud storage & building index...", expanded=True) as pipe_status:
         try:
             payload = {"thread_id": st.session_state.thread_id}
-            response = requests.post(UPDATE_API_URL, json=payload, timeout=300)
+            response = requests.post(UPDATE_API_URL, json=payload, timeout=120)
             
             if response.status_code == 200:
                 result = response.json()
@@ -203,19 +205,15 @@ if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
                 
                 if is_success and file_count > 0:
                     pipe_status.update(label="✅ Knowledge Base Update Complete!", state="complete")
-                    pipeline_container.empty()
                     st.sidebar.success(f"Success! {file_count} document(s) indexed into RAG.")
                     st.rerun()
                 else:
                     pipe_status.update(label="⚠️ Sync Finished: No Files Found", state="complete")
-                    pipeline_container.empty()
                     st.sidebar.warning(f"⚠️ {message}")
             else:
-                pipeline_container.empty()
                 st.sidebar.error("Failed to sync cloud resources.")
                 
         except requests.exceptions.ConnectionError:
-            pipeline_container.empty()
             st.sidebar.error("Connection Error: Check if Flask backend is alive.")
 
 
@@ -237,59 +235,98 @@ with st.sidebar.expander("📊 View Query Cost History Log", expanded=False):
 # --- Main Chat Interface Display ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
+        if msg.get("logs"):
+            with st.expander("📋 View Backend Execution Logs", expanded=False):
+                for l in msg["logs"]:
+                    st.code(l, language="text")
         st.markdown(msg["content"])
 
-# --- Capture New Conversation Prompts ---
+# --- Capture New Conversation Prompts with LIVE Real-Time Backend Log Streaming ---
 if user_input := st.chat_input("Ask a question or request a technical function..."):
     
     st.chat_message("user").markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
     
     with st.chat_message("assistant"):
+        log_status = st.status("🤖 Orchestrator running — Live Backend Logs:", expanded=True)
+        live_log_box = log_status.empty()
         response_placeholder = st.empty()
-        loading_container = st.empty()
-        
-        with loading_container.status("🤖 Orchestrator processing request...", expanded=False) as status:
+
+        # Run /api/chat in a background worker thread so we can poll /api/live_logs every 0.4s in real time!
+        chat_result_holder = {"response": None, "error": None, "done": False}
+        active_thread_id = st.session_state.thread_id
+
+        def _call_chat_backend():
             try:
-                payload = {"message": user_input, "thread_id": st.session_state.thread_id}
-                api_response = requests.post(FLASK_API_URL, json=payload, timeout=180)
+                payload = {"message": user_input, "thread_id": active_thread_id}
+                res = requests.post(FLASK_API_URL, json=payload, timeout=180)
+                chat_result_holder["response"] = res
+            except Exception as ex:
+                chat_result_holder["error"] = str(ex)
+            finally:
+                chat_result_holder["done"] = True
+
+        worker = threading.Thread(target=_call_chat_backend, daemon=True)
+        worker.start()
+
+        start_ts = time.time()
+        last_seen_logs = []
+        while not chat_result_holder["done"]:
+            elapsed = time.time() - start_ts
+            try:
+                poll_res = requests.get(LIVE_LOGS_URL, params={"thread_id": active_thread_id}, timeout=2)
+                if poll_res.status_code == 200:
+                    live_lines = poll_res.json().get("logs", [])
+                    if live_lines != last_seen_logs:
+                        last_seen_logs = live_lines
+                        latest_line = live_lines[-1] if live_lines else "Initializing..."
+                        log_status.update(label=f"⚙️ [{elapsed:.1f}s] {latest_line}", state="running", expanded=True)
+                        live_log_box.code("\n".join(live_lines), language="text")
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+        total_elapsed = time.time() - start_ts
+
+        if chat_result_holder["error"]:
+            log_status.update(label=f"❌ Connection Error after {total_elapsed:.1f}s", state="error", expanded=True)
+            response_placeholder.error(f"Backend connection error: {chat_result_holder['error']}")
+        else:
+            api_response = chat_result_holder["response"]
+            if api_response is not None and api_response.status_code == 200:
+                result = api_response.json()
+                agent_answer = result.get("response", "")
+                execution_logs = result.get("logs", []) or last_seen_logs
                 
-                if api_response.status_code == 200:
-                    result = api_response.json()
-                    agent_answer = result.get("response", "")
-                    execution_logs = result.get("logs", [])
-                    
-                    for log_line in execution_logs:
-                        if "Query Cost:" not in log_line:
-                            st.write(f"✔️ {log_line}")
-                    
-                    current_cost = "$0.000000"
-                    for log in execution_logs:
-                        match = re.search(r"Query Cost:\s*\$(\d+\.\d+)", log)
-                        if match:
-                            current_cost = f"${match.group(1)}"
-                    
-                    st.session_state.cost_history.append({"query": user_input, "cost": current_cost})
-                    
-                    loading_container.empty()
-                    response_placeholder.markdown(agent_answer)
-                    
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": agent_answer
-                    })
-                    st.rerun()
-                else:
-                    loading_container.empty()
-                    err_msg = "Error communicating with backend processing nodes."
-                    try:
-                        err_json = api_response.json()
-                        if "response" in err_json:
-                            err_msg = err_json["response"]
-                    except Exception:
-                        pass
-                    response_placeholder.error(err_msg)
-                    
-            except requests.exceptions.ConnectionError:
-                loading_container.empty()
-                response_placeholder.error("Critical Connection Error: Ensure Flask server is active.")
+                live_log_box.code("\n".join(execution_logs), language="text")
+                log_status.update(label=f"✅ Completed in {total_elapsed:.1f}s (Click to inspect backend logs)", state="complete", expanded=False)
+                
+                current_cost = "$0.000000"
+                for log in execution_logs:
+                    match = re.search(r"Query Cost:\s*\$(\d+\.\d+)", log)
+                    if match:
+                        current_cost = f"${match.group(1)}"
+                
+                st.session_state.cost_history.append({"query": user_input, "cost": current_cost})
+                response_placeholder.markdown(agent_answer)
+                
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": agent_answer,
+                    "logs": execution_logs
+                })
+            else:
+                err_msg = "Error communicating with backend processing nodes."
+                err_logs = last_seen_logs
+                try:
+                    err_json = api_response.json()
+                    if "response" in err_json:
+                        err_msg = err_json["response"]
+                    if "logs" in err_json:
+                        err_logs = err_json["logs"]
+                except Exception:
+                    pass
+                if err_logs:
+                    live_log_box.code("\n".join(err_logs), language="text")
+                log_status.update(label=f"❌ Backend Error after {total_elapsed:.1f}s", state="error", expanded=True)
+                response_placeholder.error(err_msg)
