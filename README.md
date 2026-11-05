@@ -32,6 +32,10 @@ This system goes beyond a simple RAG chatbot. It is a **multi-agent orchestratio
 - A **dual-layer security guardrail** blocks prompt injection and credential leaks before any LLM call is made
 - A **hallucination guardrail** cross-checks every final response against verified facts before delivery
 
+> 💡 **Infrastructure Note:** Due to cost efficiency, this Agent is hosted on Render rather than AWS.
+>
+> 📄 **Document Guideline:** Uploaded PDF documents should be a **maximum of 3 pages** for fast indexing and high-precision RAG chunk retrieval.
+
 ---
 
 ## Architecture

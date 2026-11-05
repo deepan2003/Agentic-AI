@@ -8,7 +8,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="Agentic RAG Gateway", page_icon="🤖", layout="wide")
 st.title("🤖 Intelligent Enterprise RAG Gateway")
-st.caption("Powered by Smart LLM Routing Engine & Cross-Provider Fallbacks")
+st.caption("Powered by Smart LLM Routing Engine & Cross-Provider Fallbacks • *Due to cost efficiency, this Agent is hosted on Render rather than AWS.*")
 
 # Detect backend URL from environment (for Render deployment) or fallback to localhost
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:5060")
@@ -143,11 +143,12 @@ st.sidebar.caption(f"Private RAG Knowledge Base for **{st.session_state.thread_i
 
 # Scope the uploader key to the active user so User B never sees User A's uploaded file widget state
 uploader_key = f"knowledge_pdf_uploader_{st.session_state.thread_id}"
+st.sidebar.caption("📄 *Note: PDF file should be a maximum of 3 pages.*")
 uploaded_pdf = st.sidebar.file_uploader(
     "📤 Upload PDF to Your Private Knowledge Base", 
     type=["pdf"], 
     key=uploader_key,
-    help="Uploaded PDFs are strictly isolated to your username and automatically restored when you return."
+    help="Uploaded PDFs are strictly isolated to your username and automatically restored when you return (Max 3 pages)."
 )
 
 if uploaded_pdf is not None:
@@ -155,6 +156,17 @@ if uploaded_pdf is not None:
     if st.session_state.get("last_indexed_pdf") != last_indexed_key:
         with st.sidebar.status(f"⚙️ Indexing '{uploaded_pdf.name}' into {st.session_state.thread_id}'s RAG...", expanded=True):
             try:
+                # Page count advisory check
+                import pypdf
+                import io
+                try:
+                    pdf_reader = pypdf.PdfReader(io.BytesIO(uploaded_pdf.getvalue()))
+                    page_count = len(pdf_reader.pages)
+                    if page_count > 3:
+                        st.sidebar.warning(f"⚠️ Notice: Document has {page_count} pages (Recommended: maximum 3 pages). Processing first chunks...")
+                except Exception:
+                    pass
+
                 files = {"file": (uploaded_pdf.name, uploaded_pdf.getvalue(), "application/pdf")}
                 data = {"thread_id": st.session_state.thread_id}
                 up_res = requests.post(UPLOAD_PDF_URL, files=files, data=data, timeout=60)
