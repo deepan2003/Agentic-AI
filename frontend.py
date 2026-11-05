@@ -198,7 +198,8 @@ if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
     
     with pipeline_container.status("🛸 Connecting to storage...", expanded=True) as pipe_status:
         try:
-            response = requests.post(UPDATE_API_URL, timeout=300)
+            payload = {"thread_id": st.session_state.thread_id}
+            response = requests.post(UPDATE_API_URL, json=payload, timeout=300)
             
             if response.status_code == 200:
                 result = response.json()

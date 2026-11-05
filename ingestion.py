@@ -228,16 +228,15 @@ def list_cloud_storage_files(thread_id: str = "default"):
         
     return found_files
 
-def download_papers_from_cloudinary():
-    """Downloads all raw and PDF files from Cloudinary folder into local uploads."""
-    print(f"Connecting to Cloudinary Cloud Storage (folder: '{CLOUDINARY_FOLDER}')...", flush=True)
+def download_papers_from_cloudinary(thread_id: str = "default"):
+    """Downloads all raw and PDF files from Cloudinary user folder into local user uploads."""
+    user_cloud_folder = f"{CLOUDINARY_FOLDER}/{thread_id}"
+    print(f"Connecting to Cloudinary Cloud Storage (folder: '{user_cloud_folder}')...", flush=True)
     
-    if not os.path.exists(TMP_DIR):
-        os.makedirs(TMP_DIR, exist_ok=True)
-        
-    cloud_files = list_cloud_storage_files()
+    user_upload_dir = get_user_upload_dir(thread_id)
+    cloud_files = list_cloud_storage_files(thread_id=thread_id)
     if not cloud_files:
-        print(f"⚠️ No files found in Cloudinary folder '{CLOUDINARY_FOLDER}'.", flush=True)
+        print(f"⚠️ No files found in Cloudinary folder '{user_cloud_folder}'.", flush=True)
         return []
         
     downloaded_files = []
@@ -245,12 +244,11 @@ def download_papers_from_cloudinary():
         filename = item["filename"]
         if not filename.lower().endswith(".pdf"):
             filename = f"{filename}.pdf"
-        local_path = os.path.join(TMP_DIR, filename)
+        local_path = os.path.join(user_upload_dir, filename)
         secure_url = item["url"]
         
         print(f"Downloading {filename} from Cloudinary ({item.get('bytes', 0)} bytes)...", flush=True)
         try:
-            # If secure_url is empty, fetch using cloudinary image/raw URL format
             fetch_url = secure_url
             if not fetch_url:
                 cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
@@ -270,26 +268,22 @@ def download_papers_from_cloudinary():
             
     return downloaded_files
 
-def build_local_vector_db():
-    """Reads all PDFs from uploads and Cloudinary, chunks text, and saves FAISS index."""
-    # First, pull any files from Cloudinary into TMP_DIR
-    download_papers_from_cloudinary()
+def build_local_vector_db(thread_id: str = "default"):
+    """Reads all PDFs for this specific user, chunks text, and saves isolated FAISS index."""
+    # First, pull any files from user's Cloudinary folder
+    download_papers_from_cloudinary(thread_id=thread_id)
     
-    # Collect all PDFs from TMP_DIR and UPLOAD_DIR
+    user_upload_dir = get_user_upload_dir(thread_id)
+    user_vector_path = get_user_vector_path(thread_id)
+    
     all_pdf_paths = []
-    if os.path.exists(TMP_DIR):
-        for f in os.listdir(TMP_DIR):
+    if os.path.exists(user_upload_dir):
+        for f in os.listdir(user_upload_dir):
             if f.lower().endswith(".pdf"):
-                all_pdf_paths.append(os.path.join(TMP_DIR, f))
-    if os.path.exists(UPLOAD_DIR):
-        for f in os.listdir(UPLOAD_DIR):
-            if f.lower().endswith(".pdf"):
-                path = os.path.join(UPLOAD_DIR, f)
-                if path not in all_pdf_paths:
-                    all_pdf_paths.append(path)
+                all_pdf_paths.append(os.path.join(user_upload_dir, f))
 
     if not all_pdf_paths:
-        print("❌ Pipeline stopped: No PDF files available to index.", flush=True)
+        print(f"❌ Pipeline stopped: No PDF files available to index for user '{thread_id}'.", flush=True)
         return {
             "success": False,
             "file_count": 0,
@@ -302,7 +296,7 @@ def build_local_vector_db():
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     processed_file_names = []
 
-    print(f"Processing {len(all_pdf_paths)} PDF file(s) and splitting text...", flush=True)
+    print(f"Processing {len(all_pdf_paths)} PDF file(s) for user '{thread_id}'...", flush=True)
     for file_path in all_pdf_paths:
         try:
             loader = PyPDFLoader(file_path)
@@ -323,13 +317,13 @@ def build_local_vector_db():
             "message": "Downloaded files contained no readable text."
         }
 
-    print(f"Generating embeddings for {len(all_chunks)} chunks using Hugging Face (all-MiniLM-L6-v2)...", flush=True)
+    print(f"Generating FastEmbed ONNX vectors for {len(all_chunks)} chunks (~30MB RAM)...", flush=True)
     embeddings = get_embedding_model()
     
-    os.makedirs(VECTOR_DB_PATH, exist_ok=True)
+    os.makedirs(user_vector_path, exist_ok=True)
     vector_db = FAISS.from_documents(all_chunks, embeddings)
-    vector_db.save_local(VECTOR_DB_PATH)
-    print(f"✅ Success! Local vector database saved with {len(all_chunks)} chunks from {len(processed_file_names)} file(s).", flush=True)
+    vector_db.save_local(user_vector_path)
+    print(f"✅ Success! Local vector database saved with {len(all_chunks)} chunks for user '{thread_id}'.", flush=True)
 
     return {
         "success": True,

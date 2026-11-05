@@ -96,12 +96,16 @@ def storage_status_endpoint():
 @app.route("/api/update_knowledge", methods=["POST"])
 def update_knowledge_endpoint():
     print("\n====== 🔄 KNOWLEDGE BASE UPDATE REQUESTED ======", flush=True)
+    data = request.json or {}
+    thread_id = data.get("thread_id") or request.args.get("thread_id", "default")
+    thread_id = thread_id.strip() or "default"
+    print(f"[Knowledge Engine] Syncing cloud assets for user: '{thread_id}'...", flush=True)
     
     captured_stdout = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured_stdout):
             print("⏳ [Pipeline] Checking storage and vector index...", flush=True)
-            result = build_local_vector_db()
+            result = build_local_vector_db(thread_id=thread_id)
 
         printed_logs = [line.strip() for line in captured_stdout.getvalue().splitlines() if line.strip()]
         
