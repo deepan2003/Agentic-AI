@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import threading
 import cloudinary
 import cloudinary.api
 import cloudinary.uploader
@@ -14,9 +15,20 @@ from langchain_community.document_loaders import PyPDFLoader
 # 1. Load environment variables
 load_dotenv()
 
-# Cooldown tracker to prevent repeated Cloudinary 401 retry loops within the same turn
+# Limit ONNX / OpenMP CPU threads on Render Free Tier (0.1 vCPU) to prevent thread thrashing & 60s hangs
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("ONNXRUNTIME_INTRA_OP_NUM_THREADS", "1")
+os.environ.setdefault("ONNXRUNTIME_INTER_OP_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# Cooldown & cache trackers to eliminate redundant Cloudinary network calls
 _FAILED_SYNC_TIMESTAMPS = {}
+_CLOUD_FILES_CACHE = {}
 SYNC_COOLDOWN_SECONDS = 45
+CLOUD_LIST_CACHE_TTL = 30
+
+_embedding_lock = threading.Lock()
+_ingest_embeddings = None
 
 def sanitize_thread_id(thread_id: str = "default") -> str:
     """Returns a safe, alphanumeric thread identifier for folders and cloud namespaces."""
@@ -27,34 +39,30 @@ def sanitize_thread_id(thread_id: str = "default") -> str:
 
 def get_embedding_model():
     """
-    Returns FastEmbed CPU ONNX quantized embeddings:
-    - Runs in ~30MB RAM.
-    - Zero external API keys, zero rate-limits, zero 404 errors.
-    - ZERO PyTorch / transformers loading to prevent Render 512MB OOM crashes.
+    Thread-safe singleton embedding initializer tuned for Render Free Tier (0.1 vCPU / 512MB RAM).
+    - Prevents race conditions between background startup pre-warm and incoming requests.
+    - Restricts ONNX threads=1 so it doesn't stall for 60+ seconds on shared CPUs.
     """
     global _ingest_embeddings
-    if "_ingest_embeddings" not in globals() or _ingest_embeddings is None:
-        # 1. Try langchain_community FastEmbedEmbeddings
-        try:
-            from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
-            print("[Knowledge Engine] Initializing FastEmbed CPU ONNX quantized model (~30MB RAM)...", flush=True)
-            _ingest_embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-            return _ingest_embeddings
-        except Exception as fe_err:
-            print(f"[Knowledge Engine Warning] langchain_community FastEmbed note: {fe_err}", flush=True)
+    if _ingest_embeddings is not None:
+        return _ingest_embeddings
 
-        # 2. Try direct native fastembed TextEmbedding
+    with _embedding_lock:
+        if _ingest_embeddings is not None:
+            return _ingest_embeddings
+
+        # 1. Try direct native fastembed TextEmbedding with threads=1 for fast Render CPU execution
         try:
             from fastembed import TextEmbedding
             from langchain_core.embeddings import Embeddings
 
             class NativeFastEmbed(Embeddings):
                 def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
-                    print(f"[Knowledge Engine] Initializing native FastEmbed TextEmbedding ({model_name})...", flush=True)
-                    self.model = TextEmbedding(model_name=model_name)
+                    print(f"[Knowledge Engine] Initializing FastEmbed ONNX ({model_name}, threads=1)...", flush=True)
+                    self.model = TextEmbedding(model_name=model_name, threads=1)
 
                 def embed_documents(self, texts: list) -> list:
-                    return [list(vec) for vec in self.model.embed(texts)]
+                    return [list(vec) for vec in self.model.embed(texts, batch_size=16)]
 
                 def embed_query(self, text: str) -> list:
                     return list(next(iter(self.model.embed([text]))))
@@ -64,7 +72,16 @@ def get_embedding_model():
         except Exception as nfe_err:
             print(f"[Knowledge Engine Warning] Native FastEmbed note: {nfe_err}", flush=True)
 
-        # 3. Lightweight fallback that does NOT use PyTorch (prevents OOM / 502 Bad Gateway)
+        # 2. Try langchain_community FastEmbedEmbeddings with threads=1
+        try:
+            from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+            print("[Knowledge Engine] Initializing langchain FastEmbed CPU ONNX model (threads=1)...", flush=True)
+            _ingest_embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5", threads=1)
+            return _ingest_embeddings
+        except Exception as fe_err:
+            print(f"[Knowledge Engine Warning] langchain_community FastEmbed note: {fe_err}", flush=True)
+
+        # 3. Lightweight instant fallback (0MB RAM, <1ms latency, zero PyTorch)
         from langchain_core.embeddings import Embeddings
         import numpy as np
 
@@ -89,9 +106,8 @@ def get_embedding_model():
 
         print("[Knowledge Engine Warning] Using lightweight fallback embeddings (0MB RAM, zero PyTorch).", flush=True)
         _ingest_embeddings = LightweightDeterministicEmbeddings()
-    return _ingest_embeddings
+        return _ingest_embeddings
 
-_ingest_embeddings = None
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
@@ -128,6 +144,7 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str, thread_id: str = "defau
     safe_name = os.path.basename(filename)
     safe_thread = sanitize_thread_id(thread_id)
     _FAILED_SYNC_TIMESTAMPS.pop(safe_thread, None)
+    _CLOUD_FILES_CACHE.pop(safe_thread, None)
 
     user_upload_dir = get_user_upload_dir(safe_thread)
     user_vector_path = get_user_vector_path(safe_thread)
@@ -137,7 +154,7 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str, thread_id: str = "defau
         
     print(f"[Knowledge Engine] Indexing PDF '{safe_name}' for user '{safe_thread}'...", flush=True)
 
-    # 1. Back up to Cloudinary under user's namespace as raw resource (bypasses Cloudinary PDF-as-image 401 blocks)
+    # 1. Back up to Cloudinary under user's namespace as raw resource
     user_cloud_folder = f"{CLOUDINARY_FOLDER}/{safe_thread}"
     try:
         cloudinary.uploader.upload(
@@ -195,6 +212,7 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str, thread_id: str = "defau
 
 def delete_cloudinary_file(public_id: str, resource_type: str = "raw") -> dict:
     """Deletes a file from Cloudinary given its public_id."""
+    _CLOUD_FILES_CACHE.clear()
     try:
         res = cloudinary.uploader.destroy(public_id, resource_type=resource_type)
         print(f"[Cloudinary] Delete result for '{public_id}' ({resource_type}): {res}", flush=True)
@@ -207,6 +225,7 @@ def delete_uploaded_pdf(filename: str, thread_id: str = "default") -> dict:
     """Deletes a PDF from user directory and tmp_downloads."""
     safe_name = os.path.basename(filename)
     safe_thread = sanitize_thread_id(thread_id)
+    _CLOUD_FILES_CACHE.pop(safe_thread, None)
     deleted_any = False
     dirs_to_check = [get_user_upload_dir(safe_thread), TMP_DIR, UPLOAD_BASE_DIR]
     for d in dirs_to_check:
@@ -235,12 +254,18 @@ def list_uploaded_pdfs(thread_id: str = "default") -> list:
                 })
     return sorted(files, key=lambda x: x["modified"], reverse=True)
 
-def list_cloud_storage_files(thread_id: str = "default"):
+def list_cloud_storage_files(thread_id: str = "default", use_cache: bool = True):
     """
     Queries Cloudinary and returns a deduplicated list of files available in this user's storage folder.
-    Also falls back to root folder if in default mode so legacy files are not lost.
+    Uses a 30-second in-memory cache so Streamlit sidebar refreshes don't stall the backend.
     """
     safe_thread = sanitize_thread_id(thread_id)
+    now = time.time()
+    if use_cache and safe_thread in _CLOUD_FILES_CACHE:
+        cached_time, cached_list = _CLOUD_FILES_CACHE[safe_thread]
+        if (now - cached_time) < CLOUD_LIST_CACHE_TTL:
+            return cached_list
+
     found_files = []
     seen_ids = set()
 
@@ -277,7 +302,7 @@ def list_cloud_storage_files(thread_id: str = "default"):
         except Exception as e:
             print(f"[Cloudinary Warning] Error checking raw resources for {folder_prefix}: {e}")
 
-        # 2. Check image resources (Cloudinary often stores uploaded PDFs as resource_type='image', format='pdf')
+        # 2. Check image resources
         try:
             res_img = cloudinary.api.resources(
                 type="upload",
@@ -308,14 +333,12 @@ def list_cloud_storage_files(thread_id: str = "default"):
         except Exception as e:
             print(f"[Cloudinary Warning] Error checking image resources for {folder_prefix}: {e}")
         
+    _CLOUD_FILES_CACHE[safe_thread] = (now, found_files)
     return found_files
 
 def _build_cloudinary_download_candidates(item: dict) -> list:
     """
-    Builds ordered download URL candidates for a Cloudinary resource to overcome HTTP 401 errors:
-    1. Signed private API download URL (`api.cloudinary.com/.../download`) which bypasses CDN PDF delivery restrictions.
-    2. Signed CDN delivery URL (`sign_url=True`).
-    3. Direct `secure_url`.
+    Builds ordered download URL candidates for a Cloudinary resource to overcome HTTP 401 errors.
     """
     candidates = []
     pub_id = item["public_id"]
@@ -324,7 +347,7 @@ def _build_cloudinary_download_candidates(item: dict) -> list:
     fmt = item.get("format", "")
     version = item.get("version")
 
-    # 1. Authenticated API download URLs (bypasses Cloudinary 'Allow delivery of PDF and ZIP files' 401 restriction)
+    # 1. Authenticated API download URLs
     try:
         if res_type == "raw":
             dl_url = cloudinary.utils.private_download_url(
@@ -357,7 +380,7 @@ def _build_cloudinary_download_candidates(item: dict) -> list:
     except Exception:
         pass
 
-    # 2. Signed CDN URL (handles authenticated/signed delivery requirements)
+    # 2. Signed CDN URL
     try:
         signed_url, _ = cloudinary.utils.cloudinary_url(
             pub_id,
@@ -390,12 +413,11 @@ def download_papers_from_cloudinary(thread_id: str = "default"):
     print(f"Connecting to Cloudinary Cloud Storage (folder: '{user_cloud_folder}')...", flush=True)
     
     user_upload_dir = get_user_upload_dir(safe_thread)
-    cloud_files = list_cloud_storage_files(thread_id=safe_thread)
+    cloud_files = list_cloud_storage_files(thread_id=safe_thread, use_cache=True)
     if not cloud_files:
         print(f"⚠️ No files found in Cloudinary folder '{user_cloud_folder}'.", flush=True)
         return []
 
-    # Group cloud entries by normalized filename so duplicate public_ids don't trigger 6 redundant downloads
     grouped_by_filename = {}
     for item in cloud_files:
         filename = item["filename"]
@@ -407,7 +429,6 @@ def download_papers_from_cloudinary(thread_id: str = "default"):
     for filename, items in grouped_by_filename.items():
         local_path = os.path.join(user_upload_dir, filename)
         
-        # If file already exists locally and is non-empty, keep it
         if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
             downloaded_files.append(local_path)
             continue
@@ -422,7 +443,7 @@ def download_papers_from_cloudinary(thread_id: str = "default"):
                 break
             for fetch_url in _build_cloudinary_download_candidates(candidate_item):
                 try:
-                    response = http_requests.get(fetch_url, timeout=45)
+                    response = http_requests.get(fetch_url, timeout=30)
                     if response.status_code == 200 and response.content:
                         with open(local_path, "wb") as f:
                             f.write(response.content)
@@ -449,8 +470,22 @@ def build_local_vector_db(thread_id: str = "default", force_sync: bool = False):
     safe_thread = sanitize_thread_id(thread_id)
     user_upload_dir = get_user_upload_dir(safe_thread)
     user_vector_path = get_user_vector_path(safe_thread)
+    index_file = os.path.join(user_vector_path, "index.faiss")
 
-    # Check if we recently failed syncing for this thread_id to avoid 4x retry loops in a single turn
+    # Fast-path: if index already exists on disk and force_sync is False, skip rebuilding!
+    if not force_sync and os.path.exists(index_file):
+        existing_pdfs = [
+            f for f in os.listdir(user_upload_dir) if f.lower().endswith(".pdf")
+        ] if os.path.exists(user_upload_dir) else []
+        return {
+            "success": True,
+            "file_count": len(existing_pdfs),
+            "files": existing_pdfs,
+            "chunks": 1,
+            "message": "Vector database already active and loaded."
+        }
+
+    # Check if we recently failed syncing for this thread_id to avoid retry loops
     now = time.time()
     last_failed = _FAILED_SYNC_TIMESTAMPS.get(safe_thread, 0)
     if not force_sync and (now - last_failed) < SYNC_COOLDOWN_SECONDS:
@@ -469,8 +504,15 @@ def build_local_vector_db(thread_id: str = "default", force_sync: bool = False):
                 "message": "No local PDF files available to index."
             }
 
-    # Pull any files from user's Cloudinary folder
-    download_papers_from_cloudinary(thread_id=safe_thread)
+    # Only query Cloudinary if we don't already have local PDFs (or if force_sync=True)
+    local_pdfs = [
+        os.path.join(user_upload_dir, f)
+        for f in os.listdir(user_upload_dir)
+        if f.lower().endswith(".pdf")
+    ] if os.path.exists(user_upload_dir) else []
+
+    if force_sync or not local_pdfs:
+        download_papers_from_cloudinary(thread_id=safe_thread)
     
     all_pdf_paths = []
     if os.path.exists(user_upload_dir):

@@ -6,7 +6,16 @@ import contextlib
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from ingestion import build_local_vector_db, list_cloud_storage_files, index_uploaded_pdf, list_uploaded_pdfs, delete_cloudinary_file, delete_uploaded_pdf, get_embedding_model
+from ingestion import (
+    build_local_vector_db,
+    list_cloud_storage_files,
+    index_uploaded_pdf,
+    list_uploaded_pdfs,
+    delete_cloudinary_file,
+    delete_uploaded_pdf,
+    get_embedding_model,
+    get_user_vector_path,
+)
 
 load_dotenv()
 
@@ -88,17 +97,15 @@ def storage_status_endpoint():
     """Returns actual files present in Cloudinary and the local FAISS index status for this user."""
     thread_id = request.args.get("thread_id", "default").strip() or "default"
     try:
-        cloud_files = list_cloud_storage_files(thread_id=thread_id)
         uploaded_pdfs = list_uploaded_pdfs(thread_id=thread_id)
-        from ingestion import get_user_vector_path, build_local_vector_db
+        cloud_files = list_cloud_storage_files(thread_id=thread_id, use_cache=True)
         user_vector_path = get_user_vector_path(thread_id)
         has_index = os.path.exists(user_vector_path) and os.path.exists(os.path.join(user_vector_path, "index.faiss"))
         
-        # Self-healing: if documents exist but local index was wiped on restart, auto-build immediately!
+        # Self-healing in background thread so /api/storage_status never blocks the UI!
         if not has_index and (cloud_files or uploaded_pdfs):
-            print(f"[Storage Status] Missing index detected for '{thread_id}'. Auto-building now...", flush=True)
-            build_local_vector_db(thread_id=thread_id)
-            has_index = os.path.exists(os.path.join(user_vector_path, "index.faiss"))
+            print(f"[Storage Status] Missing index detected for '{thread_id}'. Triggering background auto-build...", flush=True)
+            threading.Thread(target=build_local_vector_db, kwargs={"thread_id": thread_id}, daemon=True).start()
         
         return jsonify({
             "success": True,
@@ -131,7 +138,7 @@ def update_knowledge_endpoint():
     try:
         with contextlib.redirect_stdout(captured_stdout):
             print("⏳ [Pipeline] Checking storage and vector index...", flush=True)
-            result = build_local_vector_db(thread_id=thread_id)
+            result = build_local_vector_db(thread_id=thread_id, force_sync=True)
 
         printed_logs = [line.strip() for line in captured_stdout.getvalue().splitlines() if line.strip()]
         
@@ -161,7 +168,7 @@ def chat_endpoint():
     data = request.json or {}
     user_query = data.get("message", "").strip()
     
-    thread_id = data.get("thread_id", "web_default_session")
+    thread_id = (data.get("thread_id") or "default").strip() or "default"
     session_config = {"configurable": {"thread_id": thread_id}}
     
     if not user_query:
@@ -182,7 +189,7 @@ def chat_endpoint():
                     "logs": ["[Security Block] Input blocked by infrastructure guardrails."]
                 }), 200
 
-            print(f"⏳ [Engine] Activating Agentic Orchestrator Workflow...", flush=True)
+            print(f"⏳ [Engine] Activating Agentic Orchestrator Workflow (User: '{thread_id}')...", flush=True)
             
             state_output = agent_system.invoke(
                 {"messages": [{"role": "user", "content": secure_prompt}], "thread_id": thread_id},
@@ -195,7 +202,6 @@ def chat_endpoint():
         printed_logs = [line.strip() for line in captured_stdout.getvalue().splitlines() if line.strip()]
         combined_logs = printed_logs + smart_gateway.execution_logs
 
-        # Also print to Render server console so logs are permanently visible in Render dashboard!
         for plog in combined_logs:
             print(f"[Render Live Log] {plog}", flush=True)
 
@@ -216,4 +222,4 @@ def chat_endpoint():
 if __name__ == "__main__":
     flask_port = int(os.environ.get("FLASK_PORT", 5060))
     print(f"Starting Flask backend on 127.0.0.1:{flask_port}...", flush=True)
-    app.run(host="127.0.0.1", port=flask_port, debug=False)
+    app.run(host="127.0.0.1", port=flask_port, debug=False, threaded=True)

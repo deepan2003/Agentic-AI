@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Annotated, TypedDict
+from typing import Annotated, TypedDict, Optional
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -12,9 +12,10 @@ from gateway import verify_user_input, verify_agent_output
 
 load_dotenv()
 
-# 1. Define the Shared State with continuous message memory
-class AgentState(TypedDict):
+# 1. Define the Shared State with continuous message memory AND thread_id preservation
+class AgentState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
+    thread_id: Optional[str]
 
 AGENT_RULEBOOK_PATH = "./agent.md"
 
@@ -24,7 +25,9 @@ def invoke_orchestrator_llm(system_instruction: str, history_messages: list):
     retry, caching, and cross-provider fallback (Groq -> Gemini).
     """
     formatted = [{"role": "system", "content": system_instruction}]
-    for m in history_messages:
+    # Only send the last 6 messages to keep token latency low
+    recent_messages = history_messages[-6:] if len(history_messages) > 6 else history_messages
+    for m in recent_messages:
         role = getattr(m, "type", None) or getattr(m, "role", "user")
         if role in ["human", "user"]:
             r = "user"
@@ -47,7 +50,6 @@ def resolve_Requested_filename(user_message: str, default_stem: str = "research_
     explicit_match = re.search(r'[\w\-]+\.(txt|md|docx?|csv|json|py)', user_message, re.IGNORECASE)
     if explicit_match:
         filename = explicit_match.group(0)
-        # Upgrade .doc to .docx so python-docx writes a valid Word document
         if filename.lower().endswith(".doc"):
             filename = filename[:-4] + ".docx"
         return filename
@@ -78,11 +80,9 @@ def strip_save_instructions_for_research(user_message: str) -> str:
     """
     Removes file-saving phrasing (like 'also save that news as word document in short')
     before passing the query to hybrid_research_worker when the user is NOT asking about
-    an uploaded PDF/resume. This prevents the word 'document' in 'word document' from
-    falsely triggering the Sub-Agent's 'Resume/Document query - Banning live web search' guard.
+    an uploaded PDF/resume.
     """
     msg_lower = user_message.lower()
-    # If the user is genuinely asking about their uploaded PDF / resume / CV, keep as-is
     if any(k in msg_lower for k in ["resume", "cv", "uploaded", "pdf", "deepan", "my document", "the document"]):
         return user_message
 
@@ -93,7 +93,6 @@ def strip_save_instructions_for_research(user_message: str) -> str:
         flags=re.IGNORECASE
     ).strip()
 
-    # Fallback cleanup if 'word document' still remains in a save request
     if "word document" in cleaned.lower() and any(w in msg_lower for w in ["save", "write", "export"]):
         cleaned = re.sub(r'\bword\s+document\b', 'file', cleaned, flags=re.IGNORECASE).strip()
 
@@ -101,11 +100,13 @@ def strip_save_instructions_for_research(user_message: str) -> str:
 
 # 3. Define the Core Manager Logic Node
 def main_orchestrator_node(state: AgentState, config: dict = None):
-    # Get the latest message the user sent
     last_user_message = state["messages"][-1].content
-    thread_id = "default"
-    if config and "configurable" in config:
-        thread_id = config["configurable"].get("thread_id", "default")
+
+    # Reliably extract thread_id from state OR LangGraph config so user 'carbon' never falls back to 'default'
+    thread_id = state.get("thread_id")
+    if not thread_id and config and isinstance(config, dict):
+        thread_id = config.get("configurable", {}).get("thread_id")
+    thread_id = (thread_id or "default").strip() or "default"
     
     # Load global rules
     rules = ""
@@ -113,7 +114,7 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
         with open(AGENT_RULEBOOK_PATH, "r", encoding="utf-8") as f:
             rules = f.read()
 
-    print(f"\n[Main Agent] Analyzing request and managing context...")
+    print(f"\n[Main Agent] Analyzing request and managing context (User: '{thread_id}')...", flush=True)
     
     # --- FAST-PATH & INTENT CLASSIFIER / ROUTER ---
     clean_msg = last_user_message.strip().lower()
@@ -123,7 +124,7 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
         intent = "CHAT_HISTORY"
     elif any(kw in clean_msg for kw in ["save previous", "save the chat", "save our conversation", "export chat", "save history"]):
         intent = "SAVE_HISTORY"
-    elif any(kw in clean_msg for kw in ["resume", "cv", "pdf", "deepan", "document", "uploaded", "code", "python", "function", "who is", "what is", "how to", "search", "explain", "tell me"]):
+    elif any(kw in clean_msg for kw in ["resume", "cv", "pdf", "deepan", "document", "uploaded", "code", "python", "function", "who is", "what is", "how to", "search", "explain", "tell me", "say about", "summary", "summarize", "skills", "experience", "project", "education"]):
         intent = "RESEARCH"
     else:
         router_prompt = (
@@ -144,7 +145,7 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
     
     # Route A: Conversational Path
     if "CHITCHAT" in intent:
-        print("[Main Agent] Intent identified: Conversational Chit-Chat. Bypassing Sub-Agent RAG.")
+        print("[Main Agent] Intent identified: Conversational Chit-Chat. Bypassing Sub-Agent RAG.", flush=True)
         
         system_instruction = (
             f"{rules}\n\n"
@@ -153,15 +154,13 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
         )
         
         response = invoke_orchestrator_llm(system_instruction, state["messages"])
-        return {"messages": [response]}
+        return {"messages": [response], "thread_id": thread_id}
 
     # Route A2: Conversation Memory & Chat History Path
     elif "CHAT_HISTORY" in intent:
-        print("[Main Agent] Intent identified: Chat History / Memory Summary. Reading directly from conversation state...")
+        print("[Main Agent] Intent identified: Chat History / Memory Summary. Reading directly from conversation state...", flush=True)
         
-        # Build a clean log of all previous turns in this session
         history_transcript = []
-        # Exclude the current inquiry from the past conversation log
         past_turns = state["messages"][:-1]
         
         for m in past_turns:
@@ -175,7 +174,7 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
             return {"messages": [invoke_orchestrator_llm(
                 "Inform the user politely that this is the beginning of the chat session, so there are no earlier conversation topics logged yet.",
                 state["messages"]
-            )]}
+            )], "thread_id": thread_id}
 
         past_context = "\n\n".join(history_transcript)
         system_instruction = (
@@ -189,25 +188,21 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
         )
         
         response = invoke_orchestrator_llm(system_instruction, state["messages"])
-        return {"messages": [response]}
+        return {"messages": [response], "thread_id": thread_id}
         
     # Route B: Save History Context Path
     elif "SAVE_HISTORY" in intent:
-        print("[Main Agent] Intent identified: Save History Context. Packaging conversation history for File Saver...")
+        print("[Main Agent] Intent identified: Save History Context. Packaging conversation history for File Saver...", flush=True)
         
-        # Grab the exact message the AI generated in the previous turn
         previous_agent_text = "No previous content found to save."
         if len(state["messages"]) > 1:
             previous_agent_text = state["messages"][-2].content
             
         filename = resolve_Requested_filename(last_user_message, default_stem="saved_document")
-
-        # Clean content so that raw code blocks/Python boilerplate are not saved into text/word documents
         clean_text = clean_document_content(previous_agent_text)
 
-        # Physically execute the save tool directly to write file to projects/ folder!
         save_result = save_file_to_disk.invoke({"filename": filename, "content": clean_text})
-        print(f"[Main Agent] Physical file saved to disk: {save_result}")
+        print(f"[Main Agent] Physical file saved to disk: {save_result}", flush=True)
 
         system_instruction = (
             f"{rules}\n\n"
@@ -217,27 +212,23 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
         )
         
         response = invoke_orchestrator_llm(system_instruction, state["messages"])
-        return {"messages": [response]}
+        return {"messages": [response], "thread_id": thread_id}
         
     # Route C: Tool and Document Research Path
     else:
-        print("[Main Agent] Intent identified: Fact/Tool Dependent. Activating Research Sub-Agent...")
+        print(f"[Main Agent] Intent identified: Fact/Tool Dependent. Activating Research Sub-Agent for user '{thread_id}'...", flush=True)
         
-        # Strip file-saving phrasing (e.g. 'also save that news as word document') before calling sub-agent
-        # so the word 'document' does not falsely trigger the Sub-Agent's 'Resume/Document query -> Ban live web search' rule
         research_query = strip_save_instructions_for_research(last_user_message)
         fact_sheet = hybrid_research_worker(research_query, thread_id=thread_id)
         
-        # If user asked to save research findings to a file, ensure it is written to disk with the proper extension (.docx for Word)!
         saved_filename_note = ""
         if any(w in last_user_message.lower() for w in ["save", "create a file", "write to file", "word document", "word file", ".txt", ".md", ".doc", ".docx"]):
             target_filename = resolve_Requested_filename(last_user_message, default_stem="research_report")
             file_content = f"Research Summary:\n{fact_sheet.summary}\n\nKey Verified Facts:\n" + "\n".join(f"- {f}" for f in fact_sheet.verified_facts)
             save_file_to_disk.invoke({"filename": target_filename, "content": file_content})
-            print(f"[Main Agent] Physical file saved to disk: {target_filename}")
+            print(f"[Main Agent] Physical file saved to disk: {target_filename}", flush=True)
             saved_filename_note = f"File Saved to Disk: {target_filename}\n"
 
-        # Standardize context format returned by researcher
         research_context = (
             f"{saved_filename_note}"
             f"Research Summary: {fact_sheet.summary}\n"
@@ -258,12 +249,11 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
         
         raw_response = invoke_orchestrator_llm(system_instruction, state["messages"])
         
-        # Rigorous post-generation hallucination verification
         if fact_sheet.verified_facts:
             verified_content = verify_agent_output(raw_response.content, fact_sheet.verified_facts)
             raw_response.content = verified_content
             
-        return {"messages": [raw_response]}
+        return {"messages": [raw_response], "thread_id": thread_id}
 
 # 4. Build and Compile the LangGraph Workflow
 workflow = StateGraph(AgentState)
@@ -271,7 +261,6 @@ workflow.add_node("orchestrator", main_orchestrator_node)
 workflow.add_edge(START, "orchestrator")
 workflow.add_edge("orchestrator", END)
 
-# Attach live memory checkpointer
 chat_memory = MemorySaver()
 agent_system = workflow.compile(checkpointer=chat_memory)
 
@@ -301,7 +290,7 @@ if __name__ == "__main__":
                 continue
                 
             state_output = agent_system.invoke(
-                {"messages": [{"role": "user", "content": user_query}]},
+                {"messages": [{"role": "user", "content": user_query}], "thread_id": "active_developer_session"},
                 config=session_config
             )
             

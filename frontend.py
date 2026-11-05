@@ -21,11 +21,9 @@ DELETE_CLOUD_FILE_URL = f"{BACKEND_URL}/api/delete_cloud_file"
 # --- USER IDENTIFICATION SYSTEM (LOCKED STATE) ---
 st.sidebar.title("👤 User Profile")
 
-# Initialize the thread_id state if it doesn't exist yet
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
 
-# If the user hasn't logged in yet, show the input box with a submit button
 if not st.session_state.thread_id:
     with st.sidebar.form(key="login_form"):
         user_id_input = st.text_input("Enter your Username / Employee ID:")
@@ -62,7 +60,6 @@ PROJECTS_DIR = os.path.join(BASE_DIR, "projects")
 if not os.path.exists(PROJECTS_DIR):
     os.makedirs(PROJECTS_DIR)
 
-# Exclude internal rulebook agent.md from downloadable user documents
 saved_files = [f for f in os.listdir(PROJECTS_DIR) if os.path.isfile(os.path.join(PROJECTS_DIR, f)) and f != "agent.md"]
 
 if "file_to_delete" not in st.session_state:
@@ -99,7 +96,6 @@ if saved_files:
                 os.remove(os.path.join(PROJECTS_DIR, target_file))
                 st.sidebar.success(f"Deleted {target_file}!")
                 st.session_state.file_to_delete = None
-                time.sleep(1)
                 st.rerun()
             except Exception as e:
                 st.sidebar.error(f"Error deleting file: {e}")
@@ -116,7 +112,6 @@ st.sidebar.markdown("---")
 st.sidebar.title("🧠 Core Knowledge Management")
 st.sidebar.caption("Upload or sync PDF documents directly into active vector indexes.")
 
-# 1. Direct In-App PDF Upload (Instantly displays in frontend without page refresh)
 uploaded_pdf = st.sidebar.file_uploader(
     "📤 Upload PDF to Knowledge Base", 
     type=["pdf"], 
@@ -125,7 +120,6 @@ uploaded_pdf = st.sidebar.file_uploader(
 )
 
 if uploaded_pdf is not None:
-    # Process only if this file hasn't been uploaded in current session
     if "last_indexed_pdf" not in st.session_state or st.session_state.last_indexed_pdf != uploaded_pdf.name:
         with st.sidebar.status(f"⚙️ Indexing '{uploaded_pdf.name}' into RAG..."):
             try:
@@ -136,7 +130,6 @@ if uploaded_pdf is not None:
                     res_data = up_res.json()
                     st.sidebar.success(f"✅ Indexed '{uploaded_pdf.name}' ({res_data.get('chunks', 0)} chunks)!")
                     st.session_state.last_indexed_pdf = uploaded_pdf.name
-                    time.sleep(1)
                     st.rerun()
                 else:
                     st.sidebar.error("Failed to index PDF.")
@@ -152,7 +145,6 @@ try:
         cloud_files = storage_data.get("cloud_files", [])
         index_ready = storage_data.get("vector_index_ready", False)
 
-        # 2. Live Knowledge Base Files List (Updates automatically!)
         st.sidebar.markdown("#### 📚 Active Knowledge Base Files")
         if uploaded_pdfs:
             for up in uploaded_pdfs:
@@ -166,7 +158,6 @@ try:
 
         st.sidebar.markdown(f"**Vector Store Status:** {'🟢 Active & Loaded' if index_ready else '🔴 Empty / Waiting for PDF'}")
 
-        # Cloud storage view expander with delete capability
         with st.sidebar.expander("☁️ Cloud Storage (Cloudinary)", expanded=False):
             if cloud_files:
                 st.write(f"**{len(cloud_files)} file(s) in Cloudinary:**")
@@ -178,12 +169,11 @@ try:
                         try:
                             del_res = requests.post(
                                 DELETE_CLOUD_FILE_URL, 
-                                json={"public_id": cf["public_id"], "filename": cf["filename"], "resource_type": res_type},
+                                json={"public_id": cf["public_id"], "filename": cf["filename"], "resource_type": res_type, "thread_id": st.session_state.thread_id},
                                 timeout=15
                             )
                             if del_res.status_code == 200:
                                 st.success(f"Deleted {cf['filename']}!")
-                                time.sleep(1)
                                 st.rerun()
                         except Exception as e:
                             st.error(f"Delete failed: {e}")
@@ -209,19 +199,15 @@ if st.sidebar.button("🔄 Sync Cloud Assets to RAG System"):
                 file_count = result.get("file_count", 0)
                 
                 for log_line in pipeline_logs:
-                    pipe_status.update(label=f"🔄 Processing: {log_line}")
                     st.write(f"✔️ {log_line}")
-                    time.sleep(0.2)
                 
                 if is_success and file_count > 0:
                     pipe_status.update(label="✅ Knowledge Base Update Complete!", state="complete")
-                    time.sleep(1.5)
                     pipeline_container.empty()
                     st.sidebar.success(f"Success! {file_count} document(s) indexed into RAG.")
                     st.rerun()
                 else:
                     pipe_status.update(label="⚠️ Sync Finished: No Files Found", state="complete")
-                    time.sleep(1.5)
                     pipeline_container.empty()
                     st.sidebar.warning(f"⚠️ {message}")
             else:
@@ -263,9 +249,8 @@ if user_input := st.chat_input("Ask a question or request a technical function..
         response_placeholder = st.empty()
         loading_container = st.empty()
         
-        with loading_container.status("🤖 Orchestrator initializing environment infrastructure...", expanded=True) as status:
+        with loading_container.status("🤖 Orchestrator processing request...", expanded=False) as status:
             try:
-                # Dynamic thread extraction ensuring multi-tenant network safety
                 payload = {"message": user_input, "thread_id": st.session_state.thread_id}
                 api_response = requests.post(FLASK_API_URL, json=payload, timeout=180)
                 
@@ -276,9 +261,7 @@ if user_input := st.chat_input("Ask a question or request a technical function..
                     
                     for log_line in execution_logs:
                         if "Query Cost:" not in log_line:
-                            status.update(label=f"✨ Processing: {log_line}")
                             st.write(f"✔️ {log_line}")
-                            time.sleep(0.3)
                     
                     current_cost = "$0.000000"
                     for log in execution_logs:
