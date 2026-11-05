@@ -269,12 +269,48 @@ if st.sidebar.button("🔄 Sync My Cloud Assets to RAG"):
 st.sidebar.markdown("---")
 st.sidebar.title("💰 System Cost Analytics")
 
+# Currency Toggle (USD <-> INR)
+if "cost_currency" not in st.session_state:
+    st.session_state.cost_currency = "USD"
+
+USD_TO_INR_RATE = 86.50  # 1 USD ≈ 86.50 INR
+
+is_inr = st.session_state.cost_currency == "INR"
+btn_label = "🇮🇳 Convert to INR (₹)" if not is_inr else "💵 Convert to USD ($)"
+if st.sidebar.button(btn_label, key="currency_toggle_btn", use_container_width=True):
+    st.session_state.cost_currency = "INR" if not is_inr else "USD"
+    st.rerun()
+
+curr_symbol = "₹" if is_inr else "$"
+curr_rate = USD_TO_INR_RATE if is_inr else 1.0
+
 with st.sidebar.expander("📊 View Query Cost History Log", expanded=False):
     if st.session_state.cost_history:
+        # Calculate session total
+        total_usd = 0.0
+        for it in st.session_state.cost_history:
+            try:
+                raw_val = float(str(it.get('cost', '0')).replace('$', '').replace('₹', '').strip())
+                total_usd += raw_val
+            except Exception:
+                pass
+        
+        total_disp = total_usd * curr_rate
+        st.metric(label=f"Total Session Cost ({'INR' if is_inr else 'USD'})", value=f"{curr_symbol}{total_disp:.4f}")
+        st.caption("Conversion rate: 1 USD ≈ ₹86.50" if is_inr else "Native API currency: USD ($)")
+        st.markdown("---")
         st.markdown("### Transaction Ledger")
+        
         for idx, item in enumerate(st.session_state.cost_history[::-1]):
             st.markdown(f"**Query {len(st.session_state.cost_history) - idx}:** `{item['query']}`")
-            st.metric(label="Execution Cost", value=item['cost'])
+            try:
+                cost_num = float(str(item['cost']).replace('$', '').replace('₹', '').strip())
+                display_cost = cost_num * curr_rate
+                val_str = f"{curr_symbol}{display_cost:.6f}" if display_cost < 0.01 else f"{curr_symbol}{display_cost:.4f}"
+            except Exception:
+                val_str = item['cost']
+                
+            st.metric(label=f"Execution Cost ({'INR' if is_inr else 'USD'})", value=val_str)
             st.markdown("---")
     else:
         st.info("No cost transactions logged yet.")
