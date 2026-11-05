@@ -137,7 +137,9 @@ def index_uploaded_pdf(file_bytes: bytes, filename: str, thread_id: str = "defau
             folder=user_cloud_folder,
             resource_type="raw",
             public_id=safe_name,
-            timeout=15
+            access_mode="public",
+            type="upload",
+            timeout=20
         )
         print(f"[Knowledge Engine] Successfully backed up {safe_name} to Cloudinary folder '{user_cloud_folder}'.", flush=True)
     except Exception as e:
@@ -305,6 +307,14 @@ def download_papers_from_cloudinary(thread_id: str = "default"):
         print(f"⚠️ No files found in Cloudinary folder '{user_cloud_folder}'.", flush=True)
         return []
         
+    import base64
+    c_key = os.getenv("CLOUDINARY_API_KEY", "")
+    c_sec = os.getenv("CLOUDINARY_API_SECRET", "")
+    auth_headers = {}
+    if c_key and c_sec:
+        auth_str = base64.b64encode(f"{c_key}:{c_sec}".encode()).decode()
+        auth_headers["Authorization"] = f"Basic {auth_str}"
+
     downloaded_files = []
     for item in cloud_files:
         filename = item["filename"]
@@ -320,14 +330,27 @@ def download_papers_from_cloudinary(thread_id: str = "default"):
 
         print(f"Downloading {filename} from Cloudinary ({item.get('bytes', 0)} bytes)...", flush=True)
         try:
-            fetch_url = secure_url
-            if not fetch_url:
-                cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "")
-                res_type = "image" if item.get("format") == "pdf" else "raw"
-                fetch_url = f"https://res.cloudinary.com/{cloud_name}/{res_type}/upload/{item['public_id']}"
-                
+            # 1. Generate authenticated signed URL from Cloudinary SDK
+            res_type = "image" if item.get("format") == "pdf" else "raw"
+            signed_url, _ = cloudinary.utils.cloudinary_url(
+                item["public_id"],
+                resource_type=res_type,
+                type="upload",
+                sign_url=True,
+                secure=True
+            )
+            
+            fetch_url = signed_url or secure_url
             fetch_url = http_requests.utils.requote_uri(fetch_url)
-            response = http_requests.get(fetch_url, timeout=60)
+            
+            # Fetch with Cloudinary Basic Auth headers to bypass 401 restrictions
+            response = http_requests.get(fetch_url, headers=auth_headers, timeout=60)
+            
+            # Fallback to direct raw download URL if signed URL didn't return 200
+            if response.status_code != 200 and secure_url and secure_url != fetch_url:
+                retry_url = http_requests.utils.requote_uri(secure_url)
+                response = http_requests.get(retry_url, headers=auth_headers, timeout=60)
+
             if response.status_code == 200:
                 with open(local_path, "wb") as f:
                     f.write(response.content)

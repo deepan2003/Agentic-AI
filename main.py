@@ -12,9 +12,16 @@ from gateway import verify_user_input, verify_agent_output
 
 load_dotenv()
 
-# 1. Define the Shared State with continuous message memory
-class AgentState(TypedDict):
+from typing import Annotated, Optional
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+
+# 1. Define the Shared State with continuous message memory and user thread_id
+class AgentState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
+    thread_id: str
 
 AGENT_RULEBOOK_PATH = "./agent.md"
 
@@ -43,9 +50,10 @@ def invoke_orchestrator_llm(system_instruction: str, history_messages: list):
 def main_orchestrator_node(state: AgentState, config: dict = None):
     # Get the latest message the user sent
     last_user_message = state["messages"][-1].content
-    thread_id = "default"
-    if config and "configurable" in config:
-        thread_id = config["configurable"].get("thread_id", "default")
+    thread_id = state.get("thread_id")
+    if not thread_id and config and "configurable" in config:
+        thread_id = config["configurable"].get("thread_id")
+    thread_id = thread_id or "default"
     
     # Load global rules
     rules = ""
@@ -203,9 +211,10 @@ def main_orchestrator_node(state: AgentState, config: dict = None):
             f"CONTEXT FACTS PROVIDED BY SUB-AGENT:\n{research_context}\n\n"
             f"CRITICAL RULES:\n"
             f"1. Base your answer strictly on the provided context facts. Do NOT hallucinate or mix unrelated facts.\n"
-            f"2. Never use raw HTML tags such as <br>, <br/>, or <div>. Use Markdown bullet points (- ) and paragraphs instead.\n"
-            f"3. Directly address the user's specific inquiry. If the facts do not answer the question, state clearly that the information is unavailable in the retrieved sources.\n"
-            f"4. If the user asked to save or create a file, confirm the filename saved and remind them they can download it directly from the 'Saved Documents' sidebar."
+            f"2. You are talking directly to the user. Write out the final answer in plain text. DO NOT call tools or output function call JSON.\n"
+            f"3. Never use raw HTML tags such as <br>, <br/>, or <div>. Use Markdown bullet points (- ) and paragraphs instead.\n"
+            f"4. Directly address the user's specific inquiry. If the facts do not answer the question, state clearly that the information is unavailable in the retrieved sources.\n"
+            f"5. If the user asked to save or create a file, confirm the filename saved and remind them they can download it directly from the 'Saved Documents' sidebar."
         )
         
         raw_response = invoke_orchestrator_llm(system_instruction, state["messages"])

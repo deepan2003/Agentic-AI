@@ -185,7 +185,7 @@ def chat_endpoint():
             print(f"⏳ [Engine] Activating Agentic Orchestrator Workflow...", flush=True)
             
             state_output = agent_system.invoke(
-                {"messages": [{"role": "user", "content": secure_prompt}]},
+                {"messages": [{"role": "user", "content": secure_prompt}], "thread_id": thread_id},
                 config=session_config
             )
             

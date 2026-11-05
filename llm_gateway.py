@@ -83,11 +83,12 @@ class SmartLLMGateway:
         # Pillar 6: Rotate API key to balance high traffic load
         current_key = next(self.active_keys, os.getenv("GROQ_API_KEY"))
 
-        # Setup primary configuration parameters
+        # Setup primary configuration parameters with resilient fallback chain
         models_to_try = [
             {"model": target_model, "base_url": "https://api.groq.com/openai/v1", "api_key": current_key},
-            # Pillar 2: Invisible Fallback Target if primary provider fails
-            {"model": "gemini-1.5-flash", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "api_key": os.getenv("GEMINI_API_KEY")}
+            {"model": "llama-3.3-70b-versatile", "base_url": "https://api.groq.com/openai/v1", "api_key": current_key},
+            {"model": "gemini-2.0-flash", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "api_key": os.getenv("GEMINI_API_KEY")},
+            {"model": "gemini-1.5-flash-latest", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "api_key": os.getenv("GEMINI_API_KEY")}
         ]
 
         for attempt in models_to_try:
