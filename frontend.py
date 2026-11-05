@@ -25,12 +25,14 @@ st.sidebar.title("👤 User Profile")
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
 
-# If the user hasn't logged in yet, show the input box
+# If the user hasn't logged in yet, show the input box with a submit button
 if not st.session_state.thread_id:
-    user_id_input = st.sidebar.text_input("Enter your Username / Employee ID:")
-    
-    if user_id_input:
-        st.session_state.thread_id = user_id_input
+    with st.sidebar.form(key="login_form"):
+        user_id_input = st.text_input("Enter your Username / Employee ID:")
+        login_submitted = st.form_submit_button("🚀 Connect / Login", use_container_width=True)
+        
+    if (login_submitted or user_id_input) and user_id_input.strip():
+        st.session_state.thread_id = user_id_input.strip()
         st.session_state.messages = [] 
         st.rerun() 
     else:
