@@ -84,17 +84,24 @@ def hybrid_research_worker(query: str, thread_id: str = "default") -> FactSheet:
     # 2. 📚 STEP 1: ALWAYS SEARCH LOCAL RAG FIRST
     # ====================================================================
     print(f"[Sub-Agent] Checking user '{thread_id}' RAG database first...", flush=True)
-    local_data = query_local_research_papers(query, top_k=5, thread_id=thread_id)
-    
     query_lower = query.lower()
     is_doc_query = any(ind in query_lower for ind in [
         "resume", "cv", "pdf", "paper", "document", "uploaded", "rag", "system", 
         "profile", "candidate", "deepan", "experience", "education", "skill", "who is", "role", "fit"
     ])
+
+    local_data = query_local_research_papers(query, top_k=5, thread_id=thread_id)
+
+    # If document query and local data is still empty, auto-build from Cloudinary/uploads immediately
+    if is_doc_query and not local_data:
+        print(f"[Sub-Agent] Document query detected with empty index. Running auto-build for '{thread_id}'...", flush=True)
+        from ingestion import build_local_vector_db
+        build_local_vector_db(thread_id=thread_id)
+        local_data = query_local_research_papers(query, top_k=5, thread_id=thread_id)
     
     # If user asks for general document overview, expand search with profile keywords
     if is_doc_query and len(local_data) < 3:
-        broad_data = query_local_research_papers("profile summary experience skills education projects background", top_k=5, thread_id=thread_id)
+        broad_data = query_local_research_papers("Deepan AI Engineer Computer Vision GenAI experience skills education projects", top_k=5, thread_id=thread_id)
         seen_snippets = {d.get("content_snippet", "") for d in local_data}
         for bd in broad_data:
             if bd.get("content_snippet", "") not in seen_snippets and "error" not in bd:
@@ -139,8 +146,17 @@ def hybrid_research_worker(query: str, thread_id: str = "default") -> FactSheet:
         for doc in local_data:
             if "error" not in doc:
                 combined_context += f"Source: {doc.get('source_file', 'Uploaded PDF')}\nContent: {doc.get('content_snippet', '')}\n\n"
+    elif is_doc_query:
+        # STRICT RULE: NEVER search the public web for a private user's resume or CV!
+        print("[Sub-Agent] 🛡️ Resume/Document query with no indexed text. Banning live web search to prevent public confusion.", flush=True)
+        combined_context += (
+            "--- LOCAL KNOWLEDGE BASE (PDF) ---\n"
+            "The requested information is regarding the user's private uploaded document/resume. "
+            "However, the document index is currently empty. Please ensure the PDF is indexed via 'Sync Cloud Assets to RAG System'. "
+            "Do NOT fabricate information or search the public web for other people.\n\n"
+        )
     else:
-        print("[Sub-Agent] 🌐 No local RAG match. Falling back to Tavily live web search...", flush=True)
+        print("[Sub-Agent] 🌐 Non-document query with no local RAG match. Falling back to Tavily live web search...", flush=True)
         web_links = custom_web_search(query, max_results=1)
         for link in web_links:
             if "url" in link:

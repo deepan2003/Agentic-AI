@@ -90,9 +90,15 @@ def storage_status_endpoint():
     try:
         cloud_files = list_cloud_storage_files(thread_id=thread_id)
         uploaded_pdfs = list_uploaded_pdfs(thread_id=thread_id)
-        from ingestion import get_user_vector_path
+        from ingestion import get_user_vector_path, build_local_vector_db
         user_vector_path = get_user_vector_path(thread_id)
         has_index = os.path.exists(user_vector_path) and os.path.exists(os.path.join(user_vector_path, "index.faiss"))
+        
+        # Self-healing: if documents exist but local index was wiped on restart, auto-build immediately!
+        if not has_index and (cloud_files or uploaded_pdfs):
+            print(f"[Storage Status] Missing index detected for '{thread_id}'. Auto-building now...", flush=True)
+            build_local_vector_db(thread_id=thread_id)
+            has_index = os.path.exists(os.path.join(user_vector_path, "index.faiss"))
         
         return jsonify({
             "success": True,
