@@ -62,9 +62,13 @@ def _bg_prewarm():
 
 threading.Thread(target=_bg_prewarm, daemon=True).start()
 
+import requests as http_requests  # aliased to avoid clash with flask.request
+
 from llm_gateway import smart_gateway
 from gateway import verify_user_input
 from main import agent_system
+
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 app = Flask(__name__)
 CORS(app) 
@@ -206,6 +210,63 @@ def update_knowledge_endpoint():
             "file_count": 0,
             "logs": [f"[CRITICAL ERROR] {str(e)}"]
         }), 500
+
+@app.route("/api/transcribe", methods=["POST"])
+def transcribe_audio():
+    """Receives audio blob from frontend, sends to Deepgram Nova-3 REST API, returns transcript."""
+    if "audio" not in request.files:
+        return jsonify({"success": False, "error": "No audio file provided"}), 400
+
+    if not DEEPGRAM_API_KEY:
+        return jsonify({"success": False, "error": "Deepgram API key not configured on server."}), 500
+
+    audio_file = request.files["audio"]
+    audio_bytes = audio_file.read()
+
+    if len(audio_bytes) < 100:
+        return jsonify({"success": False, "error": "Audio too short. Please speak clearly and try again."}), 400
+
+    print(f"[Voice] Received {len(audio_bytes)} bytes of audio for transcription.", flush=True)
+
+    try:
+        headers = {
+            "Authorization": f"Token {DEEPGRAM_API_KEY}",
+            "Content-Type": "audio/wav",
+        }
+        dg_response = http_requests.post(
+            "https://api.deepgram.com/v1/listen",
+            headers=headers,
+            params={
+                "model": "nova-3",
+                "smart_format": "true",
+                "language": "en",
+                "punctuate": "true",
+            },
+            data=audio_bytes,
+            timeout=30,
+        )
+
+        if dg_response.status_code == 200:
+            result = dg_response.json()
+            transcript = (
+                result.get("results", {})
+                .get("channels", [{}])[0]
+                .get("alternatives", [{}])[0]
+                .get("transcript", "")
+            )
+            print(f"[Voice] Deepgram transcript: '{transcript}'", flush=True)
+            return jsonify({"success": True, "transcript": transcript}), 200
+        else:
+            err_detail = dg_response.text[:200]
+            print(f"[Voice] Deepgram error {dg_response.status_code}: {err_detail}", flush=True)
+            return jsonify({"success": False, "error": f"Deepgram API error ({dg_response.status_code})"}), 502
+
+    except http_requests.exceptions.Timeout:
+        return jsonify({"success": False, "error": "Deepgram request timed out. Try again."}), 504
+    except Exception as e:
+        print(f"[Voice] Transcription error: {e}", flush=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route("/api/chat", methods=["POST"])
 def chat_endpoint():

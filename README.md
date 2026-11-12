@@ -359,6 +359,9 @@ CLOUDINARY_FOLDER=agentic-rag-data
 # E2B (Code Sandbox)
 E2B_API_KEY=e2b_...
 
+# Deepgram (Voice-to-Text)
+DEEPGRAM_API_KEY=your-deepgram-api-key
+
 # LangSmith (Evaluation — optional)
 LANGCHAIN_API_KEY=ls__...
 LANGCHAIN_TRACING_V2=true
@@ -502,3 +505,42 @@ If you want the Streamlit frontend on Render too, create a second web service:
 | **Frontend** | Streamlit |
 | **Evaluation** | LangSmith, Groq judge LLM |
 | **Security** | Regex guardrails, LLM cognitive guardrails, Pydantic validation |
+| **Voice Input** | Deepgram Nova-3 (Speech-to-Text) |
+
+---
+
+## 🎙️ Voice Input (Speech-to-Text)
+
+The system supports **voice-based queries** via the Deepgram Nova-3 Speech-to-Text API.
+
+### How It Works
+
+1. Click the **🎙️** microphone button next to the chat input
+2. Record your voice query using the browser's built-in audio recorder
+3. The audio is sent to the backend → Deepgram Nova-3 transcribes it
+4. The transcript appears on screen for you to review
+5. Click **"Use This Transcript"** to send it as your query
+
+### Architecture
+
+```
+Browser Mic 🎙️ → MediaRecorder (WAV) → POST /api/transcribe
+    → Flask backend → Deepgram Nova-3 REST API → transcript
+    → Return to frontend → User reviews → Sends as chat query
+```
+
+### Key Details
+
+| | |
+|---|---|
+| **API** | Deepgram Nova-3 (`https://api.deepgram.com/v1/listen`) |
+| **Cost** | ~$0.0043/min — $200 free credit on signup (no credit card required) |
+| **Latency** | Sub-second for short voice clips |
+| **Format** | WAV audio captured via Streamlit's `st.audio_input()` |
+| **Backend** | Direct REST API call from Flask — no SDK dependency |
+
+### Setup
+
+1. Sign up at [console.deepgram.com](https://console.deepgram.com) (free, no credit card)
+2. Create an API key
+3. Add `DEEPGRAM_API_KEY=your_key` to your `.env` file (and Render environment variables)

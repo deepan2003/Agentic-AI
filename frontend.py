@@ -337,19 +337,62 @@ for msg in st.session_state.messages:
                     st.code(l, language="text")
         st.markdown(msg["content"])
 
-# --- Capture New Conversation Prompts with LIVE Real-Time Backend Log Streaming ---
-if user_input := st.chat_input("Ask a question or request a technical function..."):
-    
+
+# --- Voice Input State ---
+if "show_voice_recorder" not in st.session_state:
+    st.session_state.show_voice_recorder = False
+
+
+# --- Voice Recorder UI (expands when user clicks the 🎙️ button) ---
+if st.session_state.show_voice_recorder:
+    with st.container():
+        st.info("🎙️ **Voice Input (Deepgram Nova-3)** — Record your question below. The transcript will appear in your text box so you can review and edit before sending.")
+        audio_data = st.audio_input("Speak your question (click mic to start / stop)", key="voice_audio_recorder")
+        
+        if audio_data is not None:
+            with st.spinner("🔄 Transcribing with Deepgram Nova-3..."):
+                try:
+                    TRANSCRIBE_URL = f"{BACKEND_URL}/api/transcribe"
+                    audio_bytes = audio_data.read()
+                    files = {"audio": ("recording.wav", audio_bytes, "audio/wav")}
+                    tr_res = requests.post(TRANSCRIBE_URL, files=files, timeout=30)
+                    
+                    if tr_res.status_code == 200:
+                        tr_data = tr_res.json()
+                        transcript = tr_data.get("transcript", "").strip()
+                        
+                        if transcript:
+                            st.session_state["main_chat_prompt"] = transcript
+                            st.session_state.show_voice_recorder = False
+                            st.toast(f"🎙️ Transcribed: '{transcript}'")
+                            st.rerun()
+                        else:
+                            st.warning("⚠️ No clear speech detected. Please speak closer to your microphone and try again.")
+                    else:
+                        err = tr_res.json().get("error", "Unknown error")
+                        st.error(f"Transcription failed: {err}")
+                except requests.exceptions.ConnectionError:
+                    st.error("Cannot connect to backend. Is the Flask server running?")
+                except Exception as e:
+                    st.error(f"Transcription error: {e}")
+        
+        if st.button("❌ Close Voice Input", key="cancel_voice_btn"):
+            st.session_state.show_voice_recorder = False
+            st.rerun()
+
+
+# --- Helper: process a user message (shared by text input & voice) ---
+def _process_user_message(user_input: str):
+    """Send user message to backend with live log streaming and display response."""
     st.chat_message("user").markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
     st.session_state.user_messages_map[st.session_state.thread_id] = list(st.session_state.messages)
-    
+
     with st.chat_message("assistant"):
         log_status = st.status("🤖 Orchestrator running — Live Backend Logs:", expanded=True)
         live_log_box = log_status.empty()
         response_placeholder = st.empty()
 
-        # Run /api/chat in a background worker thread so we can poll /api/live_logs every 0.4s in real time!
         chat_result_holder = {"response": None, "error": None, "done": False}
         active_thread_id = st.session_state.thread_id
 
@@ -394,26 +437,25 @@ if user_input := st.chat_input("Ask a question or request a technical function..
                 result = api_response.json()
                 agent_answer = result.get("response", "")
                 execution_logs = result.get("logs", []) or last_seen_logs
-                
+
                 live_log_box.code("\n".join(execution_logs), language="text")
                 log_status.update(label=f"✅ Completed in {total_elapsed:.1f}s (Click to inspect backend logs)", state="complete", expanded=False)
-                
+
                 current_cost = "$0.000000"
                 for log in execution_logs:
                     match = re.search(r"Query Cost:\s*\$(\d+\.\d+)", log)
                     if match:
                         current_cost = f"${match.group(1)}"
-                
+
                 st.session_state.cost_history.append({"query": user_input, "cost": current_cost})
                 response_placeholder.markdown(agent_answer)
-                
+
                 st.session_state.messages.append({
-                    "role": "assistant", 
+                    "role": "assistant",
                     "content": agent_answer,
                     "logs": execution_logs
                 })
                 st.session_state.user_messages_map[st.session_state.thread_id] = list(st.session_state.messages)
-                # If a document was saved during this turn, rerun so the sidebar immediately displays the new file button
                 if any("Physical file saved to disk" in l for l in execution_logs):
                     st.rerun()
             else:
@@ -431,3 +473,17 @@ if user_input := st.chat_input("Ask a question or request a technical function..
                     live_log_box.code("\n".join(err_logs), language="text")
                 log_status.update(label=f"❌ Backend Error after {total_elapsed:.1f}s", state="error", expanded=True)
                 response_placeholder.error(err_msg)
+
+
+# --- Voice Input Trigger Button (docked neatly right above the chat input bar) ---
+if not st.session_state.show_voice_recorder:
+    col_spacer, col_mic_btn = st.columns([10, 2])
+    with col_mic_btn:
+        if st.button("🎙️ Voice Query", key="open_voice_recorder_btn", help="Speak your query via Deepgram Nova-3 STT", use_container_width=True):
+            st.session_state.show_voice_recorder = True
+            st.rerun()
+
+# --- Pinned Chat Input Bar ---
+user_input = st.chat_input("Ask a question or request a technical function...", key="main_chat_prompt")
+if user_input:
+    _process_user_message(user_input)
